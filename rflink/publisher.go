@@ -1,9 +1,11 @@
 package rflink
 
 import (
+	"crypto/tls"
 	"fmt"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	jsoniter "github.com/json-iterator/go"
+	"net/url"
 	"os"
 )
 
@@ -18,14 +20,10 @@ var debug = func() bool {
 	return true
 }
 
-type rfLink struct {
-	rfLink Publisher
-}
-
 // Publisher takes input from a SensorReader and publishes the SensorData that
 // has been read in an MQTT topic
 type Publisher struct {
-	c mqtt.Client
+	C mqtt.Client
 
 	Topic       string
 	SensorInput *SensorReader
@@ -35,8 +33,25 @@ var connectHandler mqtt.OnConnectHandler = func(client mqtt.Client) {
 	fmt.Println("Go_RF-Link Connected to MQTT")
 }
 
+var connectionAttemptHandler mqtt.ConnectionAttemptHandler = func(broker *url.URL, tlsCfg *tls.Config) *tls.Config {
+	if debug() {
+		fmt.Printf("Go_RF-Link Connecting to MQTT: %s://%s  with ID: %s and protocolVersion: %s \n",
+			os.Getenv("PUBLISH_SCHEME"),
+			os.Getenv("PUBLISH_HOST"),
+			os.Getenv("PUBLISH_CLIENTID"),
+			os.Getenv("PUBLISH_PROTOCOLVERSION"))
+	} else {
+		fmt.Println("Go_RF-Link Connecting to MQTT")
+	}
+	return nil
+}
+
 var connectLostHandler mqtt.ConnectionLostHandler = func(client mqtt.Client, err error) {
 	fmt.Printf("Go_RF-Link Lost Connection : %v", err)
+}
+
+var reconnectHandler mqtt.ReconnectHandler = func(client mqtt.Client, co *mqtt.ClientOptions) {
+	fmt.Print("Go_RF-Link MQTT Reconnecting")
 }
 
 // NewPublisher return a Publisher according to the options specified
@@ -48,15 +63,17 @@ func NewPublisher(o *Options) (*Publisher, error) {
 	opts.SetPassword(fmt.Sprintf("%s", o.Publish.MqttPassword))
 	opts.ProtocolVersion = o.Publish.ProtocolVersion
 	opts.CleanSession = true
+	opts.OnConnectAttempt = connectionAttemptHandler
 	opts.OnConnect = connectHandler
 	opts.OnConnectionLost = connectLostHandler
+	opts.OnReconnecting = reconnectHandler
 	cli := mqtt.NewClient(opts)
 	if token := cli.Connect(); token.Wait() && token.Error() != nil {
 		return nil, token.Error()
 	}
 
 	p := &Publisher{
-		c:     cli,
+		C:     cli,
 		Topic: o.Publish.Topic,
 	}
 	return p, nil
@@ -73,7 +90,7 @@ func (p *Publisher) Publish(sd *SensorData) error {
 		fmt.Print(string(b))
 	}
 	//Publish(topic string, qos byte, retained bool, payload interface{}) Token
-	token := p.c.Publish(p.Topic, 0, false, b)
+	token := p.C.Publish(p.Topic, 0, false, b)
 	token.Wait()
 	err = token.Error()
 	if err != nil {
@@ -105,7 +122,6 @@ func (p *Publisher) ReadAndPublish() error {
 }
 
 // Disconnect properly disconnects the MQTT network connection
-func (p *rfLink) Disconnect() interface{} {
-	p.rfLink.c.Disconnect(1000)
-	return nil
+func (p *Publisher) Disconnect() {
+	p.C.Disconnect(1000)
 }
