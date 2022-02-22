@@ -4,7 +4,7 @@ import (
 	"fmt"
 )
 
-func goRFLinkInit() error {
+func GoRFLinkInit() error {
 	// Parse options
 	opts := GetOptions()
 	// Setup the MQTT publisher

@@ -18,6 +18,10 @@ var debug = func() bool {
 	return true
 }
 
+type rfLink struct {
+	rfLink Publisher
+}
+
 // Publisher takes input from a SensorReader and publishes the SensorData that
 // has been read in an MQTT topic
 type Publisher struct {
@@ -101,6 +105,7 @@ func (p *Publisher) ReadAndPublish() error {
 }
 
 // Disconnect properly disconnects the MQTT network connection
-func (p *Publisher) Disconnect() {
-	p.c.Disconnect(1000)
+func (p *rfLink) Disconnect() interface{} {
+	p.rfLink.c.Disconnect(1000)
+	return nil
 }
