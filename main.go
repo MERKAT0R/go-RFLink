@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/MERKAT0R/go-rflink"
 	"log"
 	"os"
 	"os/signal"
