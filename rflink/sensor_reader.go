@@ -13,7 +13,7 @@ type SerialReader struct {
 
 // NewSerialReader  returns a SensorReader according to the options specified
 func NewSerialReader(o *Options) (*SerialReader, error) {
-	if debug() {
+	/*	if debug() {
 		ports, err := serial.GetPortsList()
 		if err != nil {
 			fmt.Printf("Can`t Get serial ports: %s \n", err)
@@ -26,7 +26,7 @@ func NewSerialReader(o *Options) (*SerialReader, error) {
 		for _, port := range ports {
 			fmt.Printf("Found port: %v\n", port)
 		}
-	}
+	}*/
 	fmt.Println("pre")
 	// Serial open
 	port, err := serial.Open(o.Serial.Device, &serial.Mode{
