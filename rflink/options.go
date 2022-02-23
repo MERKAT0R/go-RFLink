@@ -22,7 +22,7 @@ type Options struct {
 	// Serial connection options
 	Serial struct {
 		Device string `envconfig:"default=/dev/ttyUSB0"`
-		Baud   int    `envconfig:"default=115200"`
+		Baud   int    `envconfig:"default=9600"`
 	}
 }
 
