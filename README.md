@@ -4,7 +4,7 @@
 # Under dev!
 
 # go-rflink
-Inspired by [https://github.com/pgaxatte/go-rflink/](Pgaxatte)
+Inspired by [Pgaxatte](https://github.com/pgaxatte/go-rflink/)
 
 Publish [RFLink](https://www.rflink.nl/) Gateway temperature and humidity measurement to an MQTT topic.
   Other will be added soon, including reading from MQTT and sending to rf-link gate
