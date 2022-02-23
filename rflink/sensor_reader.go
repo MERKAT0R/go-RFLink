@@ -42,24 +42,21 @@ func NewSerialReader(o *Options) (*SerialReader, error) {
 		port: port,
 	}
 
-	go func() {
-		buff := make([]byte, 100)
+	buff := make([]byte, 100)
 
-		fmt.Println("test 1")
-		// Reads up to 100 bytes
-		n, err := port.Read(buff)
-		if err != nil {
-			fmt.Println(err)
-		}
-		//	fmt.Printf("%s", string(buff[:n]))
-		fmt.Println("test 2")
-		//		c <- SensorReader{string(buff[:n])}
-		fmt.Printf("%s", string(buff[:n]))
-		stream.Message <- string(buff[:n])
-		fmt.Printf("%s", string(buff[:n]))
-		// If we receive a newline stop reading
+	fmt.Println("test 1")
+	// Reads up to 100 bytes
+	n, err := port.Read(buff)
+	if err != nil {
+		fmt.Println(err)
+	}
+	//	fmt.Printf("%s", string(buff[:n]))
+	fmt.Println("test 2")
+	//		c <- SensorReader{string(buff[:n])}
+	stream.Message <- string(buff[:n])
+	fmt.Printf("%s", string(buff[:n]))
+	// If we receive a newline stop reading
 
-	}()
 	return sr, nil
 }
 
