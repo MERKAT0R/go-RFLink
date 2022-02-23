@@ -3,6 +3,7 @@ package rflink
 import (
 	"fmt"
 	"go.bug.st/serial"
+	"strings"
 	"time"
 )
 
@@ -42,23 +43,25 @@ func NewSerialReader(o *Options) (*SerialReader, error) {
 		port: port,
 	}
 
-	buff := make([]byte, 100)
-
 	go func() {
+		buff := make([]byte, 100)
+		for {
+			// Reads up to 100 bytes
+			n, err := port.Read(buff)
+			if err != nil {
+				fmt.Println(err)
+			}
+			//	fmt.Printf("%s", string(buff[:n]))
 
-		// Reads up to 100 bytes
-		n, err := port.Read(buff)
-		if err != nil {
-			fmt.Println(err)
+			//		c <- SensorReader{string(buff[:n])}
+			fmt.Printf("%s", string(buff[:n]))
+			stream.Message <- string(buff[:n])
+			fmt.Printf("%s", string(buff[:n]))
+			// If we receive a newline stop reading
+			if strings.Contains(string(buff[:n]), "\n") {
+				break
+			}
 		}
-		//	fmt.Printf("%s", string(buff[:n]))
-
-		//		c <- SensorReader{string(buff[:n])}
-		fmt.Printf("%s", string(buff[:n]))
-		stream.Message <- string(buff[:n])
-		fmt.Printf("%s", string(buff[:n]))
-		// If we receive a newline stop reading
-
 	}()
 	return sr, nil
 }
