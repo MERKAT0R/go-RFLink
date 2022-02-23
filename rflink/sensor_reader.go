@@ -58,7 +58,7 @@ func NewSerialReader(o *Options) (*SerialReader, error) {
 			//		c <- SensorReader{string(buff[:n])}
 
 			stream.Message <- string(buff[:n])
-
+			fmt.Printf("%s", string(buff[:n]))
 			// If we receive a newline stop reading
 			if strings.Contains(string(buff[:n]), "\n") {
 				break
