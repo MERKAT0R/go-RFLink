@@ -3,19 +3,21 @@ package rflink
 import (
 	"fmt"
 	"go.bug.st/serial"
-	"log"
 	"strings"
 	"time"
 )
 
-// SensorReader reads SensorData from the serial connection with RFLink
+// SerialReader reads SensorData from the serial connection with RFLink
+type SerialReader struct {
+	port serial.Port
+	data *SensorReader
+}
 type SensorReader struct {
-	port   serial.Port
-	reader string
+	SensorReader string
 }
 
-// NewSensorReader returns a SensorReader according to the options specified
-func NewSensorReader(o *Options) (*SensorReader, error) {
+// NewSerialReader  returns a SensorReader according to the options specified
+func NewSerialReader(o *Options) (*SerialReader, error) {
 	if debug() {
 		ports, err := serial.GetPortsList()
 		if err != nil {
@@ -40,38 +42,40 @@ func NewSensorReader(o *Options) (*SensorReader, error) {
 	if err != nil {
 		return nil, err
 	}
-
+	sr := &SerialReader{
+		port: port,
+	}
+	c := make(chan SensorReader)
 	buff := make([]byte, 100)
-	var str string
-	for {
-		// Reads up to 100 bytes
-		n, err := port.Read(buff)
-		if err != nil {
-			log.Fatal(err)
-		}
-		//	fmt.Printf("%s", string(buff[:n]))
-		str = string(buff[:n])
 
-		// If we receive a newline stop reading
-		if strings.Contains(string(buff[:n]), "\n") {
-			break
+	go func() {
+		for {
+			// Reads up to 100 bytes
+			n, err := port.Read(buff)
+			if err != nil {
+				fmt.Println(err)
+			}
+			//	fmt.Printf("%s", string(buff[:n]))
+
+			c <- SensorReader{string(buff[:n])}
+			// If we receive a newline stop reading
+			if strings.Contains(string(buff[:n]), "\n") {
+				break
+			}
 		}
-	}
-	sr := &SensorReader{
-		port:   port,
-		reader: str,
-	}
+	}()
+
 	return sr, nil
 }
 
 // ReadNext reads a line from RFLink and returns it in the form of a SensorData
 // struct
 func (sr *SensorReader) ReadNext() (*SensorData, error) {
-	sd, err := SensorDataFromMessage(sr.reader)
+	sd, err := SensorDataFromMessage(sr.SensorReader)
 	fmt.Println(sd)
 	if err != nil {
 		if debug() {
-			fmt.Printf("Error parsing message from rflink \"%s\": %s \n", sr.reader, err)
+			fmt.Printf("Error parsing message from rflink \"%s\": %s \n", sr.SensorReader, err)
 		}
 		return nil, err
 	}
@@ -80,7 +84,7 @@ func (sr *SensorReader) ReadNext() (*SensorData, error) {
 }
 
 // Close closes the serial port
-func (sr *SensorReader) Close() error {
+func (sr *SerialReader) Close() error {
 	err := sr.port.Close()
 	if err != nil {
 
