@@ -1,16 +1,16 @@
 package rflink
 
 import (
-	"bufio"
 	"fmt"
 	"go.bug.st/serial"
+	"strings"
 	"time"
 )
 
 // SensorReader reads SensorData from the serial connection with RFLink
 type SensorReader struct {
-	port   serial.Port
-	reader *bufio.Scanner
+	port serial.Port
+	//	reader *bufio.Scanner
 }
 
 // NewSensorReader returns a SensorReader according to the options specified
@@ -40,8 +40,8 @@ func NewSensorReader(o *Options) (*SensorReader, error) {
 		return nil, err
 	}
 	sr := &SensorReader{
-		port:   port,
-		reader: bufio.NewScanner(port),
+		port: port,
+		//reader: bufio.NewScanner(port),
 	}
 	return sr, nil
 }
@@ -49,27 +49,32 @@ func NewSensorReader(o *Options) (*SensorReader, error) {
 // ReadNext reads a line from RFLink and returns it in the form of a SensorData
 // struct
 func (sr *SensorReader) ReadNext() (*SensorData, error) {
-	var line string
-	for sr.reader.Scan() {
-		line = sr.reader.Text()
-	}
-	//	line, _, err := sr.reader.Scan()
-	if err := sr.reader.Err(); err != nil {
-		if debug() {
-			fmt.Printf("Cannot read from serial: %s \n", err)
+	buff := make([]byte, 100)
+	for {
+		line, err := sr.port.Read(buff)
+		//	line, _, err := sr.reader.Scan()
+		if err != nil {
+			if debug() {
+				fmt.Printf("Cannot read from serial: %s \n", err)
+			}
+			return nil, err
 		}
-		return nil, err
-	}
-
-	sd, err := SensorDataFromMessage(line)
-	if err != nil {
-		if debug() {
-			fmt.Printf("Error parsing message from rflink \"%s\": %s \n", line, err)
+		if line == 0 {
+			break
 		}
-		return nil, err
+		sd, err := SensorDataFromMessage(string(buff[:line]))
+		if err != nil {
+			if debug() {
+				fmt.Printf("Error parsing message from rflink \"%s\": %s \n", line, err)
+			}
+			return nil, err
+		}
+		if strings.Contains(string(buff[:line]), "\n") {
+			break
+		}
+		return sd, nil
 	}
-
-	return sd, nil
+	return nil, nil
 }
 
 // Close closes the serial port
