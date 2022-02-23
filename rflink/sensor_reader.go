@@ -3,27 +3,28 @@ package rflink
 import (
 	"bufio"
 	"fmt"
-	"github.com/tarm/serial"
+	"go.bug.st/serial"
 	"time"
 )
 
 // SensorReader reads SensorData from the serial connection with RFLink
 type SensorReader struct {
-	port   *serial.Port
+	port   serial.Port
 	reader *bufio.Scanner
 }
 
 // NewSensorReader returns a SensorReader according to the options specified
 func NewSensorReader(o *Options) (*SensorReader, error) {
-	port, err := serial.OpenPort(&serial.Config{
-		Name:        o.Serial.Device,
-		Baud:        o.Serial.Baud,
-		ReadTimeout: time.Second * 1,
+	port, err := serial.Open(o.Serial.Device, &serial.Mode{
+		BaudRate: o.Serial.Baud,
 	})
 	if err != nil {
 		return nil, err
 	}
-
+	err = port.SetReadTimeout(time.Second * 1)
+	if err != nil {
+		return nil, err
+	}
 	sr := &SensorReader{
 		port:   port,
 		reader: bufio.NewScanner(port),

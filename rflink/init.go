@@ -17,6 +17,7 @@ var debug = func() bool {
 	return true
 }
 
+// GoRFLinkInit Entry point for calling
 func GoRFLinkInit() error {
 	if debug() {
 		fmt.Println("*** Go_RF-Link in DEBUG mode ***")
