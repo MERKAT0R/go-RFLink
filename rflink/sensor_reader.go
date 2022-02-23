@@ -35,7 +35,10 @@ func NewSerialReader(o *Options) (*SerialReader, error) {
 	if err != nil {
 		return nil, err
 	}
-
+	err = port.SetReadTimeout(time.Second * 1)
+	if err != nil {
+		return nil, err
+	}
 	sr := &SerialReader{
 		port: port,
 	}
@@ -44,10 +47,6 @@ func NewSerialReader(o *Options) (*SerialReader, error) {
 
 	go func() {
 		for {
-			err = port.SetReadTimeout(time.Second * 1)
-			if err != nil {
-				break
-			}
 			// Reads up to 100 bytes
 			n, err := port.Read(buff)
 			if err != nil {
@@ -56,7 +55,7 @@ func NewSerialReader(o *Options) (*SerialReader, error) {
 			//	fmt.Printf("%s", string(buff[:n]))
 
 			//		c <- SensorReader{string(buff[:n])}
-
+			fmt.Printf("%s", string(buff[:n]))
 			stream.Message <- string(buff[:n])
 			fmt.Printf("%s", string(buff[:n]))
 			// If we receive a newline stop reading
