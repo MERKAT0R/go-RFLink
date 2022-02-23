@@ -19,7 +19,7 @@ func main() {
 		fmt.Print(err)
 	}
 	<-done
-	fmt.Print("Go_RF-Link Interruption signal received \n")
+	fmt.Println("Go_RF-Link Interruption signal received")
 	_, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer func() {
 		// Disconnect the rf-link serial and network Connection.
@@ -28,11 +28,11 @@ func main() {
 		rfmqtt.Disconnect()
 		err := rfserial.Close()
 		if err != nil {
-			fmt.Printf("Go_RF-Link Serial Disconnect Error: %s", err)
+			fmt.Printf("Go_RF-Link Serial Disconnect Error: %s \n", err)
 		}
 		cancel()
 	}()
 
-	fmt.Println("Go_RF-Link Terminated ::  \n", time.Now())
+	fmt.Println("Go_RF-Link Terminated :: ", time.Now())
 
 }

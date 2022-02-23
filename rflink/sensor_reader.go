@@ -4,19 +4,21 @@ import (
 	"bufio"
 	"fmt"
 	"github.com/tarm/serial"
+	"time"
 )
 
 // SensorReader reads SensorData from the serial connection with RFLink
 type SensorReader struct {
 	port   *serial.Port
-	reader *bufio.Reader
+	reader *bufio.Scanner
 }
 
 // NewSensorReader returns a SensorReader according to the options specified
 func NewSensorReader(o *Options) (*SensorReader, error) {
 	port, err := serial.OpenPort(&serial.Config{
-		Name: o.Serial.Device,
-		Baud: o.Serial.Baud,
+		Name:        o.Serial.Device,
+		Baud:        o.Serial.Baud,
+		ReadTimeout: time.Second * 1,
 	})
 	if err != nil {
 		return nil, err
@@ -24,7 +26,7 @@ func NewSensorReader(o *Options) (*SensorReader, error) {
 
 	sr := &SensorReader{
 		port:   port,
-		reader: bufio.NewReader(port),
+		reader: bufio.NewScanner(port),
 	}
 	return sr, nil
 }
@@ -32,15 +34,19 @@ func NewSensorReader(o *Options) (*SensorReader, error) {
 // ReadNext reads a line from RFLink and returns it in the form of a SensorData
 // struct
 func (sr *SensorReader) ReadNext() (*SensorData, error) {
-	line, _, err := sr.reader.ReadLine()
-	if err != nil {
+	var line string
+	for sr.reader.Scan() {
+		line = sr.reader.Text()
+	}
+	//	line, _, err := sr.reader.Scan()
+	if err := sr.reader.Err(); err != nil {
 		if debug() {
 			fmt.Printf("Cannot read from serial: %s", err)
 		}
 		return nil, err
 	}
 
-	sd, err := SensorDataFromMessage(string(line))
+	sd, err := SensorDataFromMessage(line)
 	if err != nil {
 		if debug() {
 			fmt.Printf("Error parsing message from rflink \"%s\": %s", line, err)

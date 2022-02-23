@@ -2,9 +2,25 @@ package rflink
 
 import (
 	"fmt"
+	jsoniter "github.com/json-iterator/go"
+	"os"
 )
 
+// Define more fast JSON lib then default
+var json = jsoniter.ConfigCompatibleWithStandardLibrary
+
+var debug = func() bool {
+	// Define if DEBUG enabled
+	if os.Getenv("GORFLINK_DEBUG") != "true" {
+		return false
+	}
+	return true
+}
+
 func GoRFLinkInit() error {
+	if debug() {
+		fmt.Println("*** Go_RF-Link in DEBUG mode ***")
+	}
 	// Parse options
 	opts := GetOptions()
 	// Setup the MQTT publisher

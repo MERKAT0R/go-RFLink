@@ -4,21 +4,9 @@ import (
 	"crypto/tls"
 	"fmt"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
-	jsoniter "github.com/json-iterator/go"
 	"net/url"
 	"os"
 )
-
-// Define more fast JSON lib then default
-var json = jsoniter.ConfigCompatibleWithStandardLibrary
-
-var debug = func() bool {
-	// Define if DEBUG enabled
-	if os.Getenv("GORFLINK_DEBUG") != "true" {
-		return false
-	}
-	return true
-}
 
 // Publisher takes input from a SensorReader and publishes the SensorData that
 // has been read in an MQTT topic
@@ -51,7 +39,7 @@ var connectLostHandler mqtt.ConnectionLostHandler = func(client mqtt.Client, err
 }
 
 var reconnectHandler mqtt.ReconnectHandler = func(client mqtt.Client, co *mqtt.ClientOptions) {
-	fmt.Print("Go_RF-Link MQTT Reconnecting")
+	fmt.Println("Go_RF-Link MQTT Reconnecting")
 }
 
 // NewPublisher return a Publisher according to the options specified
@@ -62,6 +50,11 @@ func NewPublisher(o *Options) (*Publisher, error) {
 	opts.SetUsername(fmt.Sprintf("%s", o.Publish.MqttUsername))
 	opts.SetPassword(fmt.Sprintf("%s", o.Publish.MqttPassword))
 	opts.ProtocolVersion = o.Publish.ProtocolVersion
+	if o.Publish.InfinityReconnect {
+		opts.ConnectRetry = true
+		fmt.Println("Go_RF-Link MQTT Connecting setup set to infinity")
+		fmt.Println("Go_RF-Link Connecting errors suppressed until first successful connect")
+	}
 	opts.CleanSession = true
 	opts.OnConnectAttempt = connectionAttemptHandler
 	opts.OnConnect = connectHandler
@@ -69,9 +62,8 @@ func NewPublisher(o *Options) (*Publisher, error) {
 	opts.OnReconnecting = reconnectHandler
 	cli := mqtt.NewClient(opts)
 	if token := cli.Connect(); token.Wait() && token.Error() != nil {
-		return nil, token.Error()
+		panic(token.Error())
 	}
-
 	p := &Publisher{
 		C:     cli,
 		Topic: o.Publish.Topic,
