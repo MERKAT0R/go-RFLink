@@ -12,7 +12,7 @@ var json = jsoniter.ConfigCompatibleWithStandardLibrary
 var debug = func() bool {
 	// Define if DEBUG enabled
 	if os.Getenv("GORFLINK_DEBUG") != "true" {
-		return false
+		return true //fixme
 	}
 	return true
 }
