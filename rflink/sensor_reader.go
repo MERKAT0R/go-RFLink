@@ -71,6 +71,7 @@ func NewSerialReader(o *Options) (*SerialReader, error) {
 // ReadNext reads a line from RFLink and returns it in the form of a SensorData
 // struct
 func (sr *SensorReader) ReadNext() (*SensorData, error) {
+	fmt.Println("###########", sr.SensorReader)
 	if len(sr.SensorReader) > 0 {
 		sd, err := SensorDataFromMessage(sr.SensorReader)
 		fmt.Println(sd)
