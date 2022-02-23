@@ -49,7 +49,7 @@ func NewSensorReader(o *Options) (*SensorReader, error) {
 		if err != nil {
 			log.Fatal(err)
 		}
-
+		fmt.Printf("%s", string(buff[:n]))
 		str = string(buff[:n])
 
 		// If we receive a newline stop reading
