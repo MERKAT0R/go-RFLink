@@ -34,6 +34,7 @@ func NewSerialReader(o *Options) (*SerialReader, error) {
 	if err != nil {
 		return nil, err
 	}
+	fmt.Println("test 0")
 	err = port.SetReadTimeout(time.Second * 1)
 	if err != nil {
 		return nil, err
