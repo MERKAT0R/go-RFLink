@@ -49,10 +49,6 @@ func NewSensorReader(o *Options) (*SensorReader, error) {
 		if err != nil {
 			log.Fatal(err)
 		}
-		if n == 0 {
-			fmt.Println("\nEOF")
-			break
-		}
 
 		str = string(buff[:n])
 
