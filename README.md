@@ -1,5 +1,6 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/MERKAT0R/go-rflink/rflink.svg)](https://pkg.go.dev/github.com/MERKAT0R/go-rflink/rflink)
 [![Build Status](https://app.travis-ci.com/MERKAT0R/go-RFLink.svg?branch=master)](https://app.travis-ci.com/MERKAT0R/go-RFLink)
+[![Go Report Card](https://goreportcard.com/badge/github.com/MERKAT0R/go-rflink)](https://goreportcard.com/report/github.com/MERKAT0R/go-rflink)
 
 # Under dev!
 
@@ -19,9 +20,9 @@ Publish [RFLink](https://www.rflink.nl/) Gateway temperature and humidity measur
 ```bash
 go get -u github.com/MERKAT0R/go-rflink
 ```
-Or with go.mod
+This library now support go.mod, so with go.mod
 ```bash
-This library now support go.mod with the import github.com/MERKAT0R/go-rflink/rflink
+import github.com/MERKAT0R/go-rflink/rflink
 ```
 
 ## Usage
