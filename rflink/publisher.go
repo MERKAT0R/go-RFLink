@@ -35,7 +35,7 @@ var connectionAttemptHandler mqtt.ConnectionAttemptHandler = func(broker *url.UR
 }
 
 var connectLostHandler mqtt.ConnectionLostHandler = func(client mqtt.Client, err error) {
-	fmt.Printf("Go_RF-Link Lost Connection : %v", err)
+	fmt.Printf("Go_RF-Link Lost Connection : %v \n", err)
 }
 
 var reconnectHandler mqtt.ReconnectHandler = func(client mqtt.Client, co *mqtt.ClientOptions) {

@@ -1,24 +1,33 @@
-[![Godoc](https://godoc.org/github.com/pgaxatte/go-rflinki/rflink?status.svg)](https://godoc.org/github.com/pgaxatte/go-rflink/rflink)
+[![Go Reference](https://pkg.go.dev/badge/github.com/MERKAT0R/go-rflink/rflink.svg)](https://pkg.go.dev/github.com/MERKAT0R/go-rflink/rflink)
+[![Build Status](https://app.travis-ci.com/MERKAT0R/go-RFLink.svg?branch=master)](https://app.travis-ci.com/MERKAT0R/go-RFLink)
+
+# Under dev!
 
 # go-rflink
-Publish rflink temperature and humidity measurement to an MQTT topic.
+Inspired by [https://github.com/pgaxatte/go-rflink/](Pgaxatte)
 
+Publish [RFLink](https://www.rflink.nl/) Gateway temperature and humidity measurement to an MQTT topic.
+  Other will be added soon, including reading from MQTT and sending to rf-link gate
+
+## Difference
+ Replaced abandoned packets, for ex now main MQTT packet is eclipse/paho.mqtt
+ So added such features like connectionretry, autoreconnect and etc
+ Other improvements
 
 ## Installation
 
 ```bash
-go get -u github.com/pgaxatte/go-rflink
+go get -u github.com/MERKAT0R/go-rflink
 ```
 
 ## Usage
 
-Optionnal environment variable can be used to override the default configuration, for example:
+Optional environment variable can be used to override the default configuration, for example:
 
 ```bash
 PUBLISH_HOST=192.168.0.1:1883 SERIAL_DEVICE=/dev/ttyACM0 go run main.go
 ```
-
-See the [Options struct definition](https://godoc.org/github.com/pgaxatte/go-rflink/rflink#Options) for a complete list of supported options.
+See more at env.sh.example
 
 ### Within a docker container
 
@@ -35,5 +44,5 @@ docker run \
 ```
 
 # TODO
-- [ ] Try to reconnect (indefinetly or a limited number of times) when MQTT or USB connection fails
-- [ ] Add tests
+- [ ] Features & Bugs ;)
+- [ ] Minor: MQTT TLS

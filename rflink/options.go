@@ -9,7 +9,7 @@ import (
 type Options struct {
 	// MQTT options
 	Publish struct {
-		Host              string `envconfig:"default=127.0.0.1:1883"` // host:port
+		Host              string `envconfig:"default=localhost:1883"` // host:port
 		Scheme            string `envconfig:"default=tcp"`
 		MqttUsername      string `envconfig:"default=username"`
 		MqttPassword      string `envconfig:"default=password"`
