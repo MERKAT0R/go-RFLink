@@ -71,16 +71,18 @@ func NewSerialReader(o *Options) (*SerialReader, error) {
 // ReadNext reads a line from RFLink and returns it in the form of a SensorData
 // struct
 func (sr *SensorReader) ReadNext() (*SensorData, error) {
-	sd, err := SensorDataFromMessage(sr.SensorReader)
-	fmt.Println(sd)
-	if err != nil {
-		if debug() {
-			fmt.Printf("Error parsing message from rflink \"%s\": %s \n", sr.SensorReader, err)
+	if len(sr.SensorReader) > 0 {
+		sd, err := SensorDataFromMessage(sr.SensorReader)
+		fmt.Println(sd)
+		if err != nil {
+			if debug() {
+				fmt.Printf("Error parsing message from rflink \"%s\": %s \n", sr.SensorReader, err)
+			}
+			return nil, err
 		}
-		return nil, err
+		return sd, nil
 	}
-	return sd, nil
-
+	return nil, nil
 }
 
 // Close closes the serial port
