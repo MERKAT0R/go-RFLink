@@ -19,6 +19,10 @@ Publish [RFLink](https://www.rflink.nl/) Gateway temperature and humidity measur
 ```bash
 go get -u github.com/MERKAT0R/go-rflink
 ```
+Or with go.mod
+```bash
+This library now support go.mod with the import github.com/MERKAT0R/go-rflink/rflink
+```
 
 ## Usage
 
