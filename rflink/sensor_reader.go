@@ -38,9 +38,6 @@ func NewSerialReader(o *Options) (*SerialReader, error) {
 	if err != nil {
 		return nil, err
 	}
-	sr := &SerialReader{
-		port: port,
-	}
 
 	buff := make([]byte, 100)
 
@@ -57,6 +54,9 @@ func NewSerialReader(o *Options) (*SerialReader, error) {
 	fmt.Printf("%s", string(buff[:n]))
 	// If we receive a newline stop reading
 
+	sr := &SerialReader{
+		port: port,
+	}
 	return sr, nil
 }
 
