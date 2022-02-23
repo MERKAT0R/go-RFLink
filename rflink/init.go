@@ -48,6 +48,7 @@ func GoRFLinkInit() error {
 		fmt.Print("Go_RF-Link Sensor reader created")
 	}
 	// Start reading/publishing loop
+	p.SensorInput = sr.data
 	go p.ReadAndPublish()
 	return nil
 }
