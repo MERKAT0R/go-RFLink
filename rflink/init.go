@@ -36,16 +36,16 @@ func GoRFLinkInit() error {
 	}
 	defer p.Disconnect()
 	// Setup the sensor reader
-	sr, err := NewSerialReader(opts)
+	_, err = NewSerialReader(opts)
 	if err != nil {
 		return err
 	}
-	defer func(sr *SerialReader) {
+	/*	defer func(sr *SerialReader) {
 		err := sr.Close()
 		if err != nil {
 			fmt.Printf("Go_RF-Link Serial Disconnect Error: %s \n", err)
 		}
-	}(sr)
+	}(sr)*/
 	if debug() {
 		fmt.Print("Go_RF-Link Sensor reader created")
 	}
