@@ -17,6 +17,8 @@ var debug = func() bool {
 	return true
 }
 
+var stream = NewServer() // setup stream
+
 // GoRFLinkInit Entry point for calling
 func GoRFLinkInit() error {
 	if debug() {
@@ -48,7 +50,6 @@ func GoRFLinkInit() error {
 		fmt.Print("Go_RF-Link Sensor reader created")
 	}
 	// Start reading/publishing loop
-	p.SensorInput = sr.data
 	go p.ReadAndPublish()
 	return nil
 }

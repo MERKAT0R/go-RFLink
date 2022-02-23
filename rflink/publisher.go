@@ -11,10 +11,8 @@ import (
 // Publisher takes input from a SensorReader and publishes the SensorData that
 // has been read in an MQTT topic
 type Publisher struct {
-	C mqtt.Client
-
-	Topic       string
-	SensorInput *SensorReader
+	C     mqtt.Client
+	Topic string
 }
 
 var connectHandler mqtt.OnConnectHandler = func(client mqtt.Client) {
@@ -95,7 +93,7 @@ func (p *Publisher) Publish(sd *SensorData) error {
 // publish the output via to Publish() method
 func (p *Publisher) ReadAndPublish() error {
 	for {
-		sd, err := p.SensorInput.ReadNext()
+		sd, err := ReadSensorData()
 		if err != nil {
 			if debug() {
 				fmt.Print(err)

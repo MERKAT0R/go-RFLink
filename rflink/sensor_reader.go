@@ -10,10 +10,6 @@ import (
 // SerialReader reads SensorData from the serial connection with RFLink
 type SerialReader struct {
 	port serial.Port
-	data *SensorReader
-}
-type SensorReader struct {
-	SensorReader string
 }
 
 // NewSerialReader  returns a SensorReader according to the options specified
@@ -32,6 +28,7 @@ func NewSerialReader(o *Options) (*SerialReader, error) {
 			fmt.Printf("Found port: %v\n", port)
 		}
 	}
+	// Serial open
 	port, err := serial.Open(o.Serial.Device, &serial.Mode{
 		BaudRate: o.Serial.Baud,
 	})
@@ -45,37 +42,41 @@ func NewSerialReader(o *Options) (*SerialReader, error) {
 	sr := &SerialReader{
 		port: port,
 	}
-	c := make(chan SensorReader)
+
 	buff := make([]byte, 100)
 
-	for {
-		// Reads up to 100 bytes
-		n, err := port.Read(buff)
-		if err != nil {
-			fmt.Println(err)
-		}
-		//	fmt.Printf("%s", string(buff[:n]))
+	go func() {
+		for {
+			// Reads up to 100 bytes
+			n, err := port.Read(buff)
+			if err != nil {
+				fmt.Println(err)
+			}
+			//	fmt.Printf("%s", string(buff[:n]))
 
-		c <- SensorReader{string(buff[:n])}
-		// If we receive a newline stop reading
-		if strings.Contains(string(buff[:n]), "\n") {
-			break
-		}
-	}
+			//		c <- SensorReader{string(buff[:n])}
 
+			stream.Message <- string(buff[:n])
+
+			// If we receive a newline stop reading
+			if strings.Contains(string(buff[:n]), "\n") {
+				break
+			}
+		}
+	}()
 	return sr, nil
 }
 
 // ReadNext reads a line from RFLink and returns it in the form of a SensorData
 // struct
-func (sr *SensorReader) ReadNext() (*SensorData, error) {
-	fmt.Println("###########", sr.SensorReader)
-	if len(sr.SensorReader) > 0 {
-		sd, err := SensorDataFromMessage(sr.SensorReader)
+func ReadSensorData() (*SensorData, error) {
+	//	fmt.Println("###########", sr.SensorReader)
+	if msg, ok := <-stream.Message; ok {
+		sd, err := SensorDataFromMessage(msg)
 		fmt.Println(sd)
 		if err != nil {
 			if debug() {
-				fmt.Printf("Error parsing message from rflink \"%s\": %s \n", sr.SensorReader, err)
+				fmt.Printf("Error parsing message from rflink \"%s\": %s \n", msg, err)
 			}
 			return nil, err
 		}
