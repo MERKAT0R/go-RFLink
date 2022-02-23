@@ -27,6 +27,7 @@ func NewSerialReader(o *Options) (*SerialReader, error) {
 			fmt.Printf("Found port: %v\n", port)
 		}
 	}
+	fmt.Println("pre")
 	// Serial open
 	port, err := serial.Open(o.Serial.Device, &serial.Mode{
 		BaudRate: o.Serial.Baud,
