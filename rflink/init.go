@@ -32,12 +32,18 @@ func GoRFLinkInit() error {
 	if debug() {
 		fmt.Print("Go_RF-Link MQTT publisher created")
 	}
+	defer p.Disconnect()
 	// Setup the sensor reader
 	sr, err := NewSensorReader(opts)
 	if err != nil {
 		return err
 	}
-	defer sr.Close()
+	defer func(sr *SensorReader) {
+		err := sr.Close()
+		if err != nil {
+			fmt.Printf("Go_RF-Link Serial Disconnect Error: %s \n", err)
+		}
+	}(sr)
 	if debug() {
 		fmt.Print("Go_RF-Link Sensor reader created")
 	}

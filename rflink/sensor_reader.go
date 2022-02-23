@@ -62,6 +62,7 @@ func (sr *SensorReader) ReadNext() (*SensorData, error) {
 func (sr *SensorReader) Close() error {
 	err := sr.port.Close()
 	if err != nil {
+
 		return err
 	}
 	return nil

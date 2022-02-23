@@ -16,20 +16,13 @@ func main() {
 	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 	err := rflink.GoRFLinkInit()
 	if err != nil {
-		fmt.Print(err)
+		fmt.Println(err)
 	}
 	<-done
 	fmt.Println("Go_RF-Link Interruption signal received")
 	_, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer func() {
-		// Disconnect the rf-link serial and network Connection.
-		var rfmqtt rflink.Publisher
-		var rfserial rflink.SensorReader
-		rfmqtt.Disconnect()
-		err := rfserial.Close()
-		if err != nil {
-			fmt.Printf("Go_RF-Link Serial Disconnect Error: %s \n", err)
-		}
+		// Something to close on exit
 		cancel()
 	}()
 
