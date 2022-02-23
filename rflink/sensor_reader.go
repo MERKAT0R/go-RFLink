@@ -48,22 +48,20 @@ func NewSerialReader(o *Options) (*SerialReader, error) {
 	c := make(chan SensorReader)
 	buff := make([]byte, 100)
 
-	go func() {
-		for {
-			// Reads up to 100 bytes
-			n, err := port.Read(buff)
-			if err != nil {
-				fmt.Println(err)
-			}
-			//	fmt.Printf("%s", string(buff[:n]))
-
-			c <- SensorReader{string(buff[:n])}
-			// If we receive a newline stop reading
-			if strings.Contains(string(buff[:n]), "\n") {
-				break
-			}
+	for {
+		// Reads up to 100 bytes
+		n, err := port.Read(buff)
+		if err != nil {
+			fmt.Println(err)
 		}
-	}()
+		//	fmt.Printf("%s", string(buff[:n]))
+
+		c <- SensorReader{string(buff[:n])}
+		// If we receive a newline stop reading
+		if strings.Contains(string(buff[:n]), "\n") {
+			break
+		}
+	}
 
 	return sr, nil
 }
