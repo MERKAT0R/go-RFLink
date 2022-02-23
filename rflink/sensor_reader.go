@@ -42,7 +42,7 @@ func (sr *SensorReader) ReadNext() (*SensorData, error) {
 	//	line, _, err := sr.reader.Scan()
 	if err := sr.reader.Err(); err != nil {
 		if debug() {
-			fmt.Printf("Cannot read from serial: %s", err)
+			fmt.Printf("Cannot read from serial: %s \n", err)
 		}
 		return nil, err
 	}
@@ -50,7 +50,7 @@ func (sr *SensorReader) ReadNext() (*SensorData, error) {
 	sd, err := SensorDataFromMessage(line)
 	if err != nil {
 		if debug() {
-			fmt.Printf("Error parsing message from rflink \"%s\": %s", line, err)
+			fmt.Printf("Error parsing message from rflink \"%s\": %s \n", line, err)
 		}
 		return nil, err
 	}
