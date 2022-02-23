@@ -21,7 +21,7 @@ type Options struct {
 
 	// Serial connection options
 	Serial struct {
-		Device string `envconfig:"default=/dev/serial/by-id/usb-Prolific_Technology_Inc._USB-Serial_Controller_D-if00-port0"`
+		Device string `envconfig:"default=/dev/ttyUSB0"`
 		Baud   int    `envconfig:"default=115200"`
 	}
 }
