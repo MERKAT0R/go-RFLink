@@ -49,7 +49,7 @@ func NewSensorReader(o *Options) (*SensorReader, error) {
 		if err != nil {
 			log.Fatal(err)
 		}
-		fmt.Printf("%s", string(buff[:n]))
+		//	fmt.Printf("%s", string(buff[:n]))
 		str = string(buff[:n])
 
 		// If we receive a newline stop reading
@@ -68,6 +68,7 @@ func NewSensorReader(o *Options) (*SensorReader, error) {
 // struct
 func (sr *SensorReader) ReadNext() (*SensorData, error) {
 	sd, err := SensorDataFromMessage(sr.reader)
+	fmt.Println(sd)
 	if err != nil {
 		if debug() {
 			fmt.Printf("Error parsing message from rflink \"%s\": %s \n", sr.reader, err)
