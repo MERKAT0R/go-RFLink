@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) 2022.  by MERKATOR <merkator@merkator.pro>
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation;
+ * This application is distributed in the hope that it will  be useful, but WITHOUT ANY WARRANTY; without even the implied warranty  * of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+ * Licensed under GNU General Public License 3.0 or later.
+ * @license GPL-3.0+ <http://spdx.org/licenses/GPL-3.0+>
+ */
+
 package rflink
 
 import (
@@ -13,7 +23,7 @@ type SerialReader struct {
 
 // NewSerialReader  returns a SensorReader according to the options specified
 func NewSerialReader(o *Options) (*SerialReader, error) {
-	/*	if debug() {
+	if debug() {
 		ports, err := serial.GetPortsList()
 		if err != nil {
 			fmt.Printf("Can`t Get serial ports: %s \n", err)
@@ -21,63 +31,29 @@ func NewSerialReader(o *Options) (*SerialReader, error) {
 		if len(ports) == 0 {
 			fmt.Println("No serial ports found!")
 		}
-
 		// Print the list of detected ports
 		for _, port := range ports {
 			fmt.Printf("Found port: %v\n", port)
 		}
-	}*/
-	fmt.Println("pre")
+	}
 	// Serial open
 	port, err := serial.Open(o.Serial.Device, &serial.Mode{
-		BaudRate: o.Serial.Baud,
+		BaudRate: 57600, // Fixed by Design
+		Parity:   serial.NoParity,
+		DataBits: 8,
+		StopBits: serial.OneStopBit,
 	})
 	if err != nil {
 		return nil, err
 	}
-	fmt.Println("test 0")
-	err = port.SetReadTimeout(time.Second * 1)
+	err = port.SetReadTimeout(time.Second * 10)
 	if err != nil {
 		return nil, err
 	}
-
-	buff := make([]byte, 100)
-
-	fmt.Println("test 1")
-	// Reads up to 100 bytes
-	n, err := port.Read(buff)
-	if err != nil {
-		fmt.Println(err)
-	}
-	//	fmt.Printf("%s", string(buff[:n]))
-	fmt.Println("test 2")
-	//		c <- SensorReader{string(buff[:n])}
-	stream.Message <- string(buff[:n])
-	fmt.Printf("%s", string(buff[:n]))
-	// If we receive a newline stop reading
-
 	sr := &SerialReader{
 		port: port,
 	}
 	return sr, nil
-}
-
-// ReadNext reads a line from RFLink and returns it in the form of a SensorData
-// struct
-func ReadSensorData() (*SensorData, error) {
-	//	fmt.Println("###########", sr.SensorReader)
-	if msg, ok := <-stream.Message; ok {
-		sd, err := SensorDataFromMessage(msg)
-		fmt.Println(sd)
-		if err != nil {
-			if debug() {
-				fmt.Printf("Error parsing message from rflink \"%s\": %s \n", msg, err)
-			}
-			return nil, err
-		}
-		return sd, nil
-	}
-	return nil, nil
 }
 
 // Close closes the serial port

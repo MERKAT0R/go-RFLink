@@ -1,3 +1,15 @@
+/*
+ * Copyright (c) 2022.  by MERKATOR <merkator@merkator.pro>
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation;
+ * This application is distributed in the hope that it will  be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU General Public License for more details.
+ * Licensed under GNU General Public License 3.0 or later.
+ * @license GPL-3.0+ <http://spdx.org/licenses/GPL-3.0+>
+ */
+
 package rflink
 
 import (
@@ -5,7 +17,6 @@ import (
 	"fmt"
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"net/url"
-	"os"
 )
 
 // Publisher takes input from a SensorReader and publishes the SensorData that
@@ -21,11 +32,9 @@ var connectHandler mqtt.OnConnectHandler = func(client mqtt.Client) {
 
 var connectionAttemptHandler mqtt.ConnectionAttemptHandler = func(broker *url.URL, tlsCfg *tls.Config) *tls.Config {
 	if debug() {
-		fmt.Printf("Go_RF-Link Connecting to MQTT: %s://%s  with ID: %s and protocolVersion: %s \n",
-			os.Getenv("PUBLISH_SCHEME"),
-			os.Getenv("PUBLISH_HOST"),
-			os.Getenv("PUBLISH_CLIENTID"),
-			os.Getenv("PUBLISH_PROTOCOLVERSION"))
+
+		fmt.Printf("Go_RF-Link Connecting to MQTT: %s \n",
+			broker.String())
 	} else {
 		fmt.Println("Go_RF-Link Connecting to MQTT")
 	}
@@ -40,6 +49,11 @@ var reconnectHandler mqtt.ReconnectHandler = func(client mqtt.Client, co *mqtt.C
 	fmt.Println("Go_RF-Link MQTT Reconnecting")
 }
 
+// Not implemented yet
+/*var messageHandler mqtt.MessageHandler = func(client mqtt.Client, msg mqtt.Message) {
+	// fixme
+}
+*/
 // NewPublisher return a Publisher according to the options specified
 func NewPublisher(o *Options) (*Publisher, error) {
 	opts := mqtt.NewClientOptions()
@@ -89,29 +103,59 @@ func (p *Publisher) Publish(sd *SensorData) error {
 	return nil
 }
 
+// Not implemented yet fixme
+/*func (p *Publisher) ReadAndBroadcast(sd *SensorData) error {
+	token := p.C.Subscribe(p.Topic, 0, messageHandler)
+	token.Wait()
+	err := token.Error()
+	if err != nil {
+		return err
+	}
+	return nil
+}*/
+
 // ReadAndPublish loops infinitely to read SensorData from the SensorReader and
 // publish the output via to Publish() method
-func (p *Publisher) ReadAndPublish() error {
+func (p *Publisher) ReadAndPublish(rflinkChans *rflinkChannels) {
 	for {
-		sd, err := ReadSensorData()
-		if err != nil {
-			if debug() {
-				fmt.Print(err)
+		if len(rflinkChans.SerialChannel.Message) > 0 {
+			if msg, ok := <-rflinkChans.SerialChannel.Message; ok {
+				sd, err := SensorDataFromMessage(msg)
+				if err != nil {
+					if debug() {
+						fmt.Printf("Error parsing message from rflink \"%s\": %s \n", msg, err)
+					}
+				}
+				err = p.Publish(sd)
+				if err != nil {
+					if debug() {
+						fmt.Printf("Error publishing message from rflink \"%s\" \n", err)
+					}
+					continue
+				}
 			}
-			continue
-		}
+			//continue
+			if len(rflinkChans.SensorChannel.Error) > 0 {
+				err := <-rflinkChans.SensorChannel.Error
+				//err :=  errors.New("dsff")
+				if err != nil {
+					if debug() {
+						fmt.Print(err)
+					}
+					continue
+				}
+			}
 
-		err = p.Publish(sd)
-		if err != nil {
-			if debug() {
-				fmt.Print(err)
-			}
-			continue
 		}
 	}
+
 }
 
 // Disconnect properly disconnects the MQTT network connection
 func (p *Publisher) Disconnect() {
 	p.C.Disconnect(1000)
+}
+
+func test() {
+	//Publish()
 }

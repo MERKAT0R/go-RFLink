@@ -1,4 +1,4 @@
-package rflink
+package main
 
 import (
 	"context"
