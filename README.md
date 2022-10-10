@@ -1,5 +1,6 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/MERKAT0R/go-rflink/rflink.svg)](https://pkg.go.dev/github.com/MERKAT0R/go-rflink/rflink)
 [![Go Report Card](https://goreportcard.com/badge/github.com/MERKAT0R/go-rflink)](https://goreportcard.com/report/github.com/MERKAT0R/go-rflink)
+[![Go](https://github.com/MERKAT0R/go-RFLink/actions/workflows/go.yml/badge.svg)](https://github.com/MERKAT0R/go-RFLink/actions/workflows/go.yml)
 
 # Beta state
 All seams working fine ;)
