@@ -18,3 +18,9 @@ require (
 	golang.org/x/sync v0.0.0-20220929204114-8fcdb60fdcc0 // indirect
 	golang.org/x/sys v0.0.0-20221006211917-84dc82d7e875 // indirect
 )
+
+// Obsolet
+retract (
+	v0.0.0-20220223200338-f752fdb4f31d
+	v0.0.0-20220223193413-6e5b53c426bf
+)
