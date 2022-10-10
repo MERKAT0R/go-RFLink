@@ -23,8 +23,8 @@ import (
 // Define more fast JSON lib then default
 var json = jsoniter.ConfigCompatibleWithStandardLibrary
 
+// Define if DEBUG enabled
 var debug = func() bool {
-	// Define if DEBUG enabled
 	if os.Getenv("GORFLINK_DEBUG") != "true" {
 		return false
 	}
