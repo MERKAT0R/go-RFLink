@@ -9,7 +9,7 @@ ADD go.sum .
 RUN go mod download && go mod verify
 COPY . .
 RUN go build -ldflags="-s -w" -v -tags=jsoniter -o /app/go-rflink ./...
-FROM alpine
+FROM alpine:3.23.3
 RUN apk update --no-cache && apk add --no-cache ca-certificates
 ENV TZ=Etc/UTC
 COPY --from=builder /usr/share/zoneinfo/$TZ /usr/share/zoneinfo/$TZ
