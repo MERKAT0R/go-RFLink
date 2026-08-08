@@ -4,10 +4,10 @@
 # go-rflink — https://github.com/MERKAT0R/go-RFLink
 # Docs: https://goreleaser.com
 #
-# Local snapshot build (no publish):
+# Local snapshot (no GitHub publish; Docker tags get platform suffix):
 #   goreleaser release --snapshot --clean
 #
-# Tag release (CI or local with GITHUB_TOKEN):
+# Tag release:
 #   git tag v1.2.3 && git push origin v1.2.3
 
 version: 2
@@ -38,18 +38,10 @@ builds:
     goarch:
       - amd64
       - arm64
-    goarm:
-      - "7"
-    ignore:
-      # RFLink sticks are typically on Linux/Windows hosts; skip exotic darwin/arm combos if needed
-      - goos: darwin
-        goarch: arm
-      - goos: windows
-        goarch: arm
 
 archives:
   - id: default
-    builds: [go-rflink]
+    ids: [go-rflink]
     formats: [tar.gz]
     name_template: >-
       {{ .ProjectName }}_
@@ -96,58 +88,47 @@ release:
     ---
 
     ## Run
-    
-    !!! Don`t forget about populating required ENVs !!!
-  
+
+    Do not forget to set the required environment variables (see `env.sh.example`).
+
     ```bash
-    # example Linux amd64
+    # Linux amd64 example
     tar -xzf go-rflink_{{ .Version }}_Linux_x86_64.tar.gz
     ./go-rflink
     ```
-    Windows - unzip & Go .exe    
-     
+
+    Windows: unzip and run `go-rflink.exe`.
+
     Released with [GoReleaser](https://github.com/goreleaser/goreleaser).
 
-# Optional: publish multi-arch image to GHCR when DOCKER_ enabled in CI
-dockers:
-  - id: go-rflink-amd64
-    ids: [go-rflink]
-    goos: linux
-    goarch: amd64
-    image_templates:
-      - "ghcr.io/merkat0r/go-rflink:{{ .Version }}-amd64"
-      - "ghcr.io/merkat0r/go-rflink:latest-amd64"
+# Multi-arch images via buildx (replaces dockers + docker_manifests).
+# Images are built/pushed in the publish phase. Snapshot builds produce
+# per-platform tags instead of a manifest.
+# Multi-arch requires buildx "docker-container" driver (default "docker" cannot
+# build linux/amd64+arm64). One-time local setup:
+#   docker buildx create --name multi --driver docker-container --use
+#   docker buildx inspect --bootstrap
+# CI: use docker/setup-qemu-action + docker/setup-buildx-action before goreleaser.
+# SBOM/provenance off for broader driver compatibility.
+dockers_v2:
+  - ids: [go-rflink]
     dockerfile: Dockerfile.goreleaser
-    use: buildx
-    build_flag_templates:
-      - "--platform=linux/amd64"
-      - "--label=org.opencontainers.image.title=go-rflink"
-      - "--label=org.opencontainers.image.version={{ .Version }}"
-      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
-      - "--label=org.opencontainers.image.source=https://github.com/MERKAT0R/go-RFLink"
-
-  - id: go-rflink-arm64
-    ids: [go-rflink]
-    goos: linux
-    goarch: arm64
-    image_templates:
-      - "ghcr.io/merkat0r/go-rflink:{{ .Version }}-arm64"
-      - "ghcr.io/merkat0r/go-rflink:latest-arm64"
-    dockerfile: Dockerfile.goreleaser
-    use: buildx
-    build_flag_templates:
-      - "--platform=linux/arm64"
-      - "--label=org.opencontainers.image.title=go-rflink"
-      - "--label=org.opencontainers.image.version={{ .Version }}"
-      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
-      - "--label=org.opencontainers.image.source=https://github.com/MERKAT0R/go-RFLink"
-
-docker_manifests:
-  - name_template: "ghcr.io/merkat0r/go-rflink:{{ .Version }}"
-    image_templates:
-      - "ghcr.io/merkat0r/go-rflink:{{ .Version }}-amd64"
-      - "ghcr.io/merkat0r/go-rflink:{{ .Version }}-arm64"
-  - name_template: "ghcr.io/merkat0r/go-rflink:latest"
-    image_templates:
-      - "ghcr.io/merkat0r/go-rflink:latest-amd64"
-      - "ghcr.io/merkat0r/go-rflink:latest-arm64"
+    images:
+      - ghcr.io/merkat0r/go-rflink
+    tags:
+      - "{{ .Version }}"
+      - "{{ if not .IsNightly }}latest{{ end }}"
+      - "{{ if .IsNightly }}nightly{{ end }}"
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    sbom: false
+    flags:
+      - "--provenance=false"
+    labels:
+      "org.opencontainers.image.title": "go-rflink"
+      "org.opencontainers.image.description": "RFLink serial → MQTT bridge"
+      "org.opencontainers.image.source": "https://github.com/MERKAT0R/go-RFLink"
+      "org.opencontainers.image.revision": "{{ .FullCommit }}"
+      "org.opencontainers.image.version": "{{ .Version }}"
+      "org.opencontainers.image.created": "{{ .Date }}"
