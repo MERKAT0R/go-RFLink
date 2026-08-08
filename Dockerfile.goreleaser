@@ -1,7 +1,7 @@
-# Used by GoReleaser docker builds (binary is copied in by goreleaser).
 FROM alpine:3.24
 RUN apk add --no-cache ca-certificates tzdata
 ENV TZ=Etc/UTC
 WORKDIR /app
-COPY go-rflink /app/go-rflink
+ARG TARGETPLATFORM
+COPY ${TARGETPLATFORM}/go-rflink /app/go-rflink
 ENTRYPOINT ["/app/go-rflink"]
