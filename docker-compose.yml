@@ -1,0 +1,104 @@
+# go-rflink — RFLink serial → MQTT bridge
+#
+# Usage:
+#   cp env.sh.example .env   # optional; compose reads .env automatically
+#   docker compose up -d --build
+#
+# Pass the host serial device, e.g. /dev/ttyUSB0 or /dev/ttyACM0.
+# On Linux the container needs access to that device node.
+
+services:
+  go-rflink:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${VERSION:-dev}
+        GIT_SHA: ${GIT_SHA:-unknown}
+    image: go-rflink:local
+    container_name: go-rflink
+    restart: unless-stopped
+    # Serial port on the host (change to match your RFLink stick)
+    devices:
+      - "${SERIAL_DEVICE:-/dev/ttyUSB0}:${SERIAL_DEVICE:-/dev/ttyUSB0}"
+    # Uncomment if the device node permissions require it:
+    # privileged: true
+    group_add:
+      # typical dialout GID on Debian/Ubuntu hosts; adjust if needed
+      - "20"
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # MQTT
+      PUBLISH_HOST: ${PUBLISH_HOST:-mosquitto:1883}
+      PUBLISH_SCHEME: ${PUBLISH_SCHEME:-tcp}
+      PUBLISH_MQTT_USERNAME: ${PUBLISH_MQTT_USERNAME:-}
+      PUBLISH_MQTT_PASSWORD: ${PUBLISH_MQTT_PASSWORD:-}
+      PUBLISH_CLIENT_ID: ${PUBLISH_CLIENT_ID:-gorflink}
+      PUBLISH_TOPIC: ${PUBLISH_TOPIC:-rflink}
+      PUBLISH_CMD_TOPIC: ${PUBLISH_CMD_TOPIC:-}
+      PUBLISH_QOS: ${PUBLISH_QOS:-0}
+      PUBLISH_RETAIN: ${PUBLISH_RETAIN:-false}
+      PUBLISH_KEEPALIVE: ${PUBLISH_KEEPALIVE:-30}
+      PUBLISH_SESSION_EXPIRY: ${PUBLISH_SESSION_EXPIRY:-0}
+      PUBLISH_INFINITY_RECONNECT: ${PUBLISH_INFINITY_RECONNECT:-true}
+      PUBLISH_CONNECT_RETRY_INTERVAL: ${PUBLISH_CONNECT_RETRY_INTERVAL:-5}
+      PUBLISH_TLS_CA_FILE: ${PUBLISH_TLS_CA_FILE:-}
+      PUBLISH_TLS_INSECURE_SKIP_VERIFY: ${PUBLISH_TLS_INSECURE_SKIP_VERIFY:-false}
+      # Sensors / commands
+      PUBLISH_TEMPERATURE_UNIT: ${PUBLISH_TEMPERATURE_UNIT:-C}
+      PUBLISH_DEDUP_WINDOW_MS: ${PUBLISH_DEDUP_WINDOW_MS:-3000}
+      PUBLISH_PENDING_TTL_SEC: ${PUBLISH_PENDING_TTL_SEC:-60}
+      PUBLISH_HEALTH_LOG_INTERVAL_SEC: ${PUBLISH_HEALTH_LOG_INTERVAL_SEC:-300}
+      PUBLISH_FRIENDLY_NAMES: ${PUBLISH_FRIENDLY_NAMES:-}
+      PUBLISH_HWID_MAP: ${PUBLISH_HWID_MAP:-}
+      PUBLISH_IGNORE_LIST: ${PUBLISH_IGNORE_LIST:-}
+      PUBLISH_COMMAND_WHITELIST: ${PUBLISH_COMMAND_WHITELIST:-}
+      PUBLISH_COMMAND_RATE_LIMIT: ${PUBLISH_COMMAND_RATE_LIMIT:-5}
+      PUBLISH_COMMAND_MAX_LEN: ${PUBLISH_COMMAND_MAX_LEN:-256}
+      # Home Assistant
+      PUBLISH_HOME_ASSISTANT_DISCOVERY: ${PUBLISH_HOME_ASSISTANT_DISCOVERY:-false}
+      PUBLISH_HA_DISCOVERY_PREFIX: ${PUBLISH_HA_DISCOVERY_PREFIX:-homeassistant}
+      PUBLISH_HA_BUTTONS: ${PUBLISH_HA_BUTTONS:-}
+      PUBLISH_HA_SWITCHES: ${PUBLISH_HA_SWITCHES:-}
+      # Serial (path inside container = host path when bind-mapped 1:1)
+      SERIAL_DEVICE: ${SERIAL_DEVICE:-/dev/ttyUSB0}
+      SERIAL_BAUD: ${SERIAL_BAUD:-57600}
+      SERIAL_READ_TIMEOUT_SEC: ${SERIAL_READ_TIMEOUT_SEC:-10}
+      SERIAL_RECONNECT_MIN_DELAY_SEC: ${SERIAL_RECONNECT_MIN_DELAY_SEC:-3}
+      SERIAL_RECONNECT_MAX_DELAY_SEC: ${SERIAL_RECONNECT_MAX_DELAY_SEC:-60}
+      SERIAL_WATCHDOG_SEC: ${SERIAL_WATCHDOG_SEC:-120}
+      SERIAL_PING_INTERVAL_SEC: ${SERIAL_PING_INTERVAL_SEC:-60}
+      SERIAL_PING_TIMEOUT_SEC: ${SERIAL_PING_TIMEOUT_SEC:-5}
+      SERIAL_PING_FAIL_THRESHOLD: ${SERIAL_PING_FAIL_THRESHOLD:-3}
+    # Optional: mount CA cert for TLS
+    # volumes:
+    #   - ./certs/ca.crt:/certs/ca.crt:ro
+    depends_on:
+      - mosquitto
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Optional local broker for testing. Point PUBLISH_HOST at your
+  # production broker and remove this service + depends_on if unused.
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: go-rflink-mosquitto
+    restart: unless-stopped
+    ports:
+      - "${MOSQUITTO_PORT:-1883}:1883"
+    volumes:
+      - ./deploy/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto_data:/mosquitto/data
+      - mosquitto_log:/mosquitto/log
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+volumes:
+  mosquitto_data:
+  mosquitto_log:

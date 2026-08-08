@@ -1,0 +1,153 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# vim: set ts=2 sw=2 tw=0 fo=cnqoj
+#
+# go-rflink — https://github.com/MERKAT0R/go-RFLink
+# Docs: https://goreleaser.com
+#
+# Local snapshot build (no publish):
+#   goreleaser release --snapshot --clean
+#
+# Tag release (CI or local with GITHUB_TOKEN):
+#   git tag v1.2.3 && git push origin v1.2.3
+
+version: 2
+
+project_name: go-rflink
+
+before:
+  hooks:
+    - go mod tidy
+    - go mod verify
+
+builds:
+  - id: go-rflink
+    main: .
+    binary: go-rflink
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X rflink.Version={{ .Version }}
+      - -X rflink.GitSHA={{ .ShortCommit }}
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    goarm:
+      - "7"
+    ignore:
+      # RFLink sticks are typically on Linux/Windows hosts; skip exotic darwin/arm combos if needed
+      - goos: darwin
+        goarch: arm
+      - goos: windows
+        goarch: arm
+
+archives:
+  - id: default
+    builds: [go-rflink]
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+      {{- if .Arm }}v{{ .Arm }}{{ end }}
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE*
+      - README.md
+      - env.sh.example
+      - Dockerfile
+      - docker-compose.yml
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - Merge pull request
+      - Merge branch
+
+release:
+  github:
+    owner: MERKAT0R
+    name: go-RFLink
+  name_template: "v{{ .Version }}"
+  draft: false
+  prerelease: auto
+  footer: >-
+
+    ---
+
+    ## Run
+    
+    !!! Don`t forget about populating required ENVs !!!
+  
+    ```bash
+    # example Linux amd64
+    tar -xzf go-rflink_{{ .Version }}_Linux_x86_64.tar.gz
+    ./go-rflink
+    ```
+    Windows - unzip & Go .exe    
+     
+    Released with [GoReleaser](https://github.com/goreleaser/goreleaser).
+
+# Optional: publish multi-arch image to GHCR when DOCKER_ enabled in CI
+dockers:
+  - id: go-rflink-amd64
+    ids: [go-rflink]
+    goos: linux
+    goarch: amd64
+    image_templates:
+      - "ghcr.io/merkat0r/go-rflink:{{ .Version }}-amd64"
+      - "ghcr.io/merkat0r/go-rflink:latest-amd64"
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title=go-rflink"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.source=https://github.com/MERKAT0R/go-RFLink"
+
+  - id: go-rflink-arm64
+    ids: [go-rflink]
+    goos: linux
+    goarch: arm64
+    image_templates:
+      - "ghcr.io/merkat0r/go-rflink:{{ .Version }}-arm64"
+      - "ghcr.io/merkat0r/go-rflink:latest-arm64"
+    dockerfile: Dockerfile.goreleaser
+    use: buildx
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title=go-rflink"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+      - "--label=org.opencontainers.image.source=https://github.com/MERKAT0R/go-RFLink"
+
+docker_manifests:
+  - name_template: "ghcr.io/merkat0r/go-rflink:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/merkat0r/go-rflink:{{ .Version }}-amd64"
+      - "ghcr.io/merkat0r/go-rflink:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/merkat0r/go-rflink:latest"
+    image_templates:
+      - "ghcr.io/merkat0r/go-rflink:latest-amd64"
+      - "ghcr.io/merkat0r/go-rflink:latest-arm64"
