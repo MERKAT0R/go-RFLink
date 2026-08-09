@@ -88,16 +88,21 @@ release:
 
     ## Run
 
-    Do not forget to set the required environment variables (see `env.sh.example`).
-
+    Do not forget to set the _required_ environment variables (see `env.sh.example`).
+   
+    # Docker
     ```bash
-    # Linux amd64 example
-    tar -xzf go-rflink_{{ .Version }}_Linux_x86_64.tar.gz
-    ./go-rflink
+    docker pull ghcr.io/merkat0r/go-rflink:latest
     ```
-
-    Windows: unzip and run `go-rflink.exe`.
-
+    # Linux x64 
+    ```bash
+    tar -xzf go-rflink_0.1.4-082026-beta_Linux_x86_64.tar.gz ./go-rflink
+    ```
+    # Windows x64
+    ```bash
+    unzip and run `go-rflink.exe`
+    ```
+ 
     Released with [GoReleaser](https://github.com/goreleaser/goreleaser).
 
 # Multi-arch images via buildx (replaces dockers + docker_manifests).

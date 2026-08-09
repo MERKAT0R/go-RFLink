@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 
 	"go.bug.st/serial"
@@ -112,15 +113,13 @@ func (sr *SerialReader) disconnect() {
 	}
 }
 
-// Write sends a command to RFLink. A trailing newline is appended when missing.
+// Write sends a command to RFLink. Ensures the payload ends with CR+LF.
 func (sr *SerialReader) Write(command string) error {
-	payload := command
+	payload := strings.TrimRight(command, "\r\n")
 	if payload == "" {
 		return fmt.Errorf("empty rflink command")
 	}
-	if payload[len(payload)-1] != '\n' {
-		payload += "\n\r"
-	}
+	payload += "\r\n"
 
 	sr.mu.Lock()
 	defer sr.mu.Unlock()

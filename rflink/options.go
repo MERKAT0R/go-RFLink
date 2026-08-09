@@ -318,10 +318,11 @@ func (o *Options) CommandAllowed(payload string) bool {
 	return false
 }
 
-// NormalizeCommand trims, enforces trailing ';', rejects empty/too-long payloads.
+// NormalizeCommand trims whitespace and trailing CR/LF, enforces trailing ';',
+// rejects empty/too-long payloads.
 func (o *Options) NormalizeCommand(payload string) (string, error) {
 	cmd := strings.TrimSpace(payload)
-	cmd = strings.TrimRight(cmd, "")
+	cmd = strings.TrimRight(cmd, "\r\n")
 	cmd = strings.TrimSpace(cmd)
 	if cmd == "" {
 		return "", fmt.Errorf("empty command")
