@@ -9,7 +9,7 @@ COPY . .
 ARG VERSION=dev
 ARG GIT_SHA=unknown
 RUN go build -trimpath \
-    -ldflags="-s -w -X rflink.Version=${VERSION} -X rflink.GitSHA=${GIT_SHA}" \
+    -ldflags="-s -w -X github.com/MERKAT0R/go-RFLink/rflink.Version=${VERSION} -X github.com/MERKAT0R/go-RFLink/rflink.GitSHA=${GIT_SHA}" \
     -o /app/go-rflink .
 
 FROM alpine:3.24

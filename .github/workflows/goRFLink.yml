@@ -47,7 +47,7 @@ jobs:
             *) VERSION="ci-$(git rev-parse --short HEAD)" ;;
           esac
           echo "Building with Version=${VERSION}"
-          go build -ldflags "-X rflink.Version=${VERSION} -X rflink.GitSHA=$(git rev-parse --short HEAD)" -v -o go-rflink .
+          go build -ldflags "-X github.com/MERKAT0R/go-RFLink/rflink.Version=${VERSION} -X github.com/MERKAT0R/go-RFLink/rflink.GitSHA=$(git rev-parse --short HEAD)" -v -o go-rflink .
 
       - name: Test
         run: go test ./...

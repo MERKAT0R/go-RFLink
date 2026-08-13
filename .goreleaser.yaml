@@ -28,7 +28,7 @@ builds:
     flags:
       - -trimpath
     ldflags:
-      - -s -w -X rflink.Version={{.Version}} -X rflink.GitSHA={{.ShortCommit}}
+      - -s -w -X github.com/MERKAT0R/go-RFLink/rflink.Version={{.Version}} -X github.com/MERKAT0R/go-RFLink/rflink.GitSHA={{.ShortCommit}}
     goos:
       - linux
       - windows
@@ -86,13 +86,13 @@ release:
   draft: false
   prerelease: auto
   footer: >-
-
+    
     ---
-
+    
     ## Run
-
-    Do not forget to set the _required_ environment variables (see `env.sh.example`).
-   
+    
+    Do not forget to set the _required_ environment variables (see `env.sh.example` & carefully `README.md`).
+    
     # Docker
     ```bash
     docker pull ghcr.io/merkat0r/go-rflink:latest
@@ -105,7 +105,7 @@ release:
     ```bash
     unzip and run `go-rflink.exe`
     ```
- 
+    
     Released with [GoReleaser](https://github.com/goreleaser/goreleaser).
 
 # Multi-arch images via buildx (replaces dockers + docker_manifests).
