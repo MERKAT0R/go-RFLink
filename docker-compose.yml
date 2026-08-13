@@ -2,7 +2,11 @@
 #
 # Usage:
 #   cp env.sh.example .env   # optional; compose reads .env automatically
-#   docker compose up -d --build
+#   docker compose up -d              # pull/build per IMAGE
+#   docker compose up -d --build      # force local build
+#
+# Pre-built image (no build):
+#   IMAGE=ghcr.io/merkat0r/go-rflink:latest docker compose up -d
 #
 # Pass the host serial device, e.g. /dev/ttyUSB0 or /dev/ttyACM0.
 # On Linux the container needs access to that device node.
@@ -15,7 +19,7 @@ services:
       args:
         VERSION: ${VERSION:-dev}
         GIT_SHA: ${GIT_SHA:-unknown}
-    image: go-rflink:local
+    image: ${IMAGE:-go-rflink:local}
     container_name: go-rflink
     restart: unless-stopped
     # Serial port on the host (change to match your RFLink stick)
@@ -26,6 +30,14 @@ services:
     group_add:
       # typical dialout GID on Debian/Ubuntu hosts; adjust if needed
       - "20"
+    ports:
+      # GUI/API — bind to localhost on the host by default
+      - "${HTTP_HOST_PORT:-127.0.0.1:8080}:${HTTP_CONTAINER_PORT:-8080}"
+    volumes:
+      # runtime.json, backups (API token hashes, GUI overlays)
+      - ${DATA_VOLUME:-go-rflink-data}:/app/data
+      # Optional: mount CA cert for TLS
+      # - ./certs/ca.crt:/certs/ca.crt:ro
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       # MQTT
@@ -70,11 +82,28 @@ services:
       SERIAL_PING_INTERVAL_SEC: ${SERIAL_PING_INTERVAL_SEC:-60}
       SERIAL_PING_TIMEOUT_SEC: ${SERIAL_PING_TIMEOUT_SEC:-5}
       SERIAL_PING_FAIL_THRESHOLD: ${SERIAL_PING_FAIL_THRESHOLD:-3}
-    # Optional: mount CA cert for TLS
-    # volumes:
-    #   - ./certs/ca.crt:/certs/ca.crt:ro
+      # HTTP API / Web GUI
+      HTTP_LISTEN: ${HTTP_LISTEN:-0.0.0.0:8080}
+      HTTP_AUTH_TOKEN: ${HTTP_AUTH_TOKEN:-}
+      HTTP_GUI: ${HTTP_GUI:-true}
+      HTTP_READ_ONLY: ${HTTP_READ_ONLY:-false}
+      HTTP_CORS_ORIGINS: ${HTTP_CORS_ORIGINS:-}
+      HTTP_TRUSTED_PROXIES: ${HTTP_TRUSTED_PROXIES:-}
+      HTTP_RAW_BUFFER_SIZE: ${HTTP_RAW_BUFFER_SIZE:-100}
+      HTTP_SENSOR_BUFFER_SIZE: ${HTTP_SENSOR_BUFFER_SIZE:-50}
+      # Runtime overlay (tokens, webhooks, friendly names, …)
+      RUNTIME_CONFIG_FILE: ${RUNTIME_CONFIG_FILE:-/app/data/runtime.json}
+      API_AUTH_TOKEN: ${API_AUTH_TOKEN:-}
+      API_TOKEN_PEPPER: ${API_TOKEN_PEPPER:-}
+      WEBHOOKS_JSON: ${WEBHOOKS_JSON:-}
     depends_on:
       - mosquitto
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     logging:
       driver: json-file
       options:
@@ -102,3 +131,4 @@ services:
 volumes:
   mosquitto_data:
   mosquitto_log:
+  go-rflink-data:

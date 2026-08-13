@@ -8,6 +8,7 @@ package rflink
 import (
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/caarlos0/env/v11"
@@ -95,6 +96,40 @@ type Options struct {
 		PingFailThreshold int `env:"SERIAL_PING_FAIL_THRESHOLD" envDefault:"3"`
 	}
 
+	// HTTP — local control API + optional embedded Web GUI (empty Listen = disabled).
+	HTTP struct {
+		// Listen address, e.g. ":8080" or "127.0.0.1:8080". Empty disables HTTP.
+		Listen string `env:"HTTP_LISTEN"`
+		// AuthToken — GUI login only (session). Not accepted as long-lived API Bearer.
+		AuthToken string `env:"HTTP_AUTH_TOKEN"`
+		// GUI — serve embedded status UI at / (default true when Listen is set).
+		GUI bool `env:"HTTP_GUI" envDefault:"true"`
+		// RawBufferSize — ring buffer of recent serial lines for GET /api/v1/rflink/raw (0 = default 100).
+		RawBufferSize int `env:"HTTP_RAW_BUFFER_SIZE" envDefault:"100"`
+		// SensorBufferSize — recent sensor samples for GET /api/v1/sensors (0 = default 50).
+		SensorBufferSize int `env:"HTTP_SENSOR_BUFFER_SIZE" envDefault:"50"`
+		// CORSOrigins — comma-separated allowed Origins for CORS (empty = CORS disabled).
+		// Example: "https://ha.example.com,http://localhost:8123"
+		CORSOrigins string `env:"HTTP_CORS_ORIGINS"`
+		// TrustedProxies — CIDRs/IPs allowed to set X-Forwarded-For / X-Real-IP (empty = never trust).
+		// Example: "10.0.0.0/8,192.168.0.0/16,127.0.0.1"
+		TrustedProxies string `env:"HTTP_TRUSTED_PROXIES"`
+		// ReadOnly — when true, reject command / config / rediscover mutations (default false).
+		ReadOnly bool `env:"HTTP_READ_ONLY" envDefault:"false"`
+	}
+
+	// RuntimeConfigFile — overlay for GUI-editable settings (default data/runtime.json).
+	RuntimeConfigFile string `env:"RUNTIME_CONFIG_FILE" envDefault:"data/runtime.json"`
+
+	// APIAuthTokens — comma-separated name:TOKEN[:expire] for machine API clients only.
+	// Expire: never | 30m | 24h | RFC3339 date. GUI login uses HTTP_AUTH_TOKEN, not these.
+	APIAuthTokens string `env:"API_AUTH_TOKEN"`
+	// APITokenPepper — optional HMAC pepper for API token hashes (empty = plain SHA-256).
+	APITokenPepper string `env:"API_TOKEN_PEPPER"`
+
+	// WebhooksJSON — optional JSON array of webhooks (same schema as runtime webhooks).
+	WebhooksJSON string `env:"WEBHOOKS_JSON"`
+
 	// parsed at GetOptions time
 	friendlyNameMap  map[string]string
 	hwidMap          map[string]string // key: upper ID or MODEL_ID → canonical HWID
@@ -102,6 +137,9 @@ type Options struct {
 	ignoreSet        map[string]struct{}
 	haButtons        []haActuatorButton
 	haSwitches       []haActuatorSwitch
+	apiTokens        []apiToken // from env and/or runtime file
+	webhooks         []RuntimeWebhook
+	runtimeMu        sync.RWMutex
 }
 
 // haActuatorButton is a Home Assistant button discovery entity.
@@ -212,9 +250,16 @@ func GetOptions() (*Options, error) {
 		opts.Publish.CommandMaxLen = 256
 	}
 
+	if opts.HTTP.RawBufferSize <= 0 {
+		opts.HTTP.RawBufferSize = 100
+	}
+	if opts.HTTP.SensorBufferSize <= 0 {
+		opts.HTTP.SensorBufferSize = 50
+	}
+
 	// Full config in JSON then GORFLINK_DEBUGSHOWPARSEDCONFIGINLOGINSECURE mode - VERY INSECURE!
 	if debugShowParsedConfigInLogINSECURE() {
-		b, _ := json.MarshalIndent(opts, "", "  ")
+		b, _ := json.MarshalIndent(&opts, "", "  ")
 		fmt.Println(string(b))
 	}
 
@@ -283,6 +328,8 @@ func parseCommandWhitelist(raw string) []string {
 
 // FriendlyNameFor returns a configured friendly name for the given HWID, or "".
 func (o *Options) FriendlyNameFor(hwid string) string {
+	o.runtimeMu.RLock()
+	defer o.runtimeMu.RUnlock()
 	if o.friendlyNameMap == nil {
 		return ""
 	}
@@ -292,6 +339,8 @@ func (o *Options) FriendlyNameFor(hwid string) string {
 // CanonicalHWID resolves an optional fixed HWID for a sensor ID / default HWID.
 // Lookup order: exact defaultHWID, then raw ID.
 func (o *Options) CanonicalHWID(id, defaultHWID string) string {
+	o.runtimeMu.RLock()
+	defer o.runtimeMu.RUnlock()
 	if o.hwidMap == nil {
 		return defaultHWID
 	}
@@ -319,7 +368,7 @@ func (o *Options) CommandAllowed(payload string) bool {
 }
 
 // NormalizeCommand trims whitespace and trailing CR/LF, enforces trailing ';',
-// rejects empty/too-long payloads.
+// max length, and strict RFLink command shape (NN;Name;…;).
 func (o *Options) NormalizeCommand(payload string) (string, error) {
 	cmd := strings.TrimSpace(payload)
 	cmd = strings.TrimRight(cmd, "\r\n")
@@ -337,15 +386,16 @@ func (o *Options) NormalizeCommand(payload string) (string, error) {
 	if len(cmd) > maxLen {
 		return "", fmt.Errorf("command too long (%d > %d)", len(cmd), maxLen)
 	}
-	// basic sanity: RFLink commands start with digits
-	if cmd[0] < '0' || cmd[0] > '9' {
-		return "", fmt.Errorf("command must start with a digit (got %q)", cmd[:1])
+	if err := ValidateRFLinkCommand(cmd); err != nil {
+		return "", err
 	}
 	return cmd, nil
 }
 
 // SensorIgnored reports whether this sensor should be dropped.
 func (o *Options) SensorIgnored(model, hwid string) bool {
+	o.runtimeMu.RLock()
+	defer o.runtimeMu.RUnlock()
 	if len(o.ignoreSet) == 0 {
 		return false
 	}

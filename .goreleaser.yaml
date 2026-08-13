@@ -56,8 +56,10 @@ archives:
     files:
       - LICENSE*
       - README.md
+      - HTTP.md
       - env.sh.example
       - Dockerfile
+      - docker-compose.ghcr.yml
       - docker-compose.yml
 
 checksum:

@@ -11,11 +11,15 @@ ARG GIT_SHA=unknown
 RUN go build -trimpath \
     -ldflags="-s -w -X rflink.Version=${VERSION} -X rflink.GitSHA=${GIT_SHA}" \
     -o /app/go-rflink .
- 
+
 FROM alpine:3.24
-RUN apk add --no-cache ca-certificates tzdata
+# ca-certificates: TLS to MQTT brokers
+# tzdata: correct timestamps in logs / runtime
+# wget: Docker HEALTHCHECK / compose healthcheck (busybox wget exists, full package is explicit)
+RUN apk add --no-cache ca-certificates tzdata wget
 ENV TZ=Etc/UTC
 WORKDIR /app
 COPY --from=builder /app/go-rflink /app/go-rflink
 # serial device is expected to be passed at runtime (--device)
+# optional: HEALTHCHECK when HTTP is enabled (override via compose if Listen differs)
 ENTRYPOINT ["./go-rflink"]

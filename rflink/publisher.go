@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"maps"
 	"net/url"
 	"os"
 	"strings"
@@ -35,13 +36,15 @@ type pendingSensor struct {
 
 // CmdResult is published to {topic}/cmd/result after an actuator command attempt.
 type CmdResult struct {
-	Command    string `json:"command"`
-	Status     string `json:"status"`
-	Error      string `json:"error,omitempty"`
-	ReceivedAt string `json:"received_at"`
+	Command            string  `json:"command"`
+	Status             string  `json:"status"`
+	Error              string  `json:"error,omitempty"`
+	ReceivedAt         string  `json:"received_at"`
+	RateLimitRemaining float64 `json:"rate_limit_remaining,omitempty"`
+	RateLimitPerSec    int     `json:"rate_limit_per_sec,omitempty"`
 }
 
-type healthSnapshot struct {
+type HealthSnapshot struct {
 	Version            string            `json:"version"`
 	GitSHA             string            `json:"git_sha"`
 	StartedAt          string            `json:"started_at"`
@@ -110,6 +113,33 @@ type Publisher struct {
 	lastPongAt   time.Time
 	pingFails    atomic.Uint64 // consecutive missed PONGs
 	rflinkUnresp atomic.Bool
+
+	// HTTP debug buffers (ring)
+	rawMu     sync.Mutex
+	rawLines  []rawLineEntry
+	rawCap    int
+	sampleMu  sync.Mutex
+	samples   []sensorSample
+	sampleCap int
+
+	rawHookMu    sync.Mutex
+	rawHook      func(rawLineEntry) // optional live stream (WebSocket hub)
+	sensorHookMu sync.Mutex
+	sensorHook   func(hwid string, sumJSON []byte)
+}
+
+type rawLineEntry struct {
+	At      string `json:"at"`
+	Message string `json:"message"`
+}
+
+type sensorSample struct {
+	At     string            `json:"at"`
+	HWID   string            `json:"hwid"`
+	Model  string            `json:"model,omitempty"`
+	ID     string            `json:"id,omitempty"`
+	Name   string            `json:"name,omitempty"`
+	Fields map[string]string `json:"fields,omitempty"`
 }
 
 // NewPublisher returns a Publisher according to the options specified.
@@ -125,6 +155,14 @@ func NewPublisher(parent context.Context, o *Options) (*Publisher, error) {
 	}
 
 	ctx, cancel := context.WithCancel(parent)
+	rawCap := o.HTTP.RawBufferSize
+	if rawCap <= 0 {
+		rawCap = 100
+	}
+	sampleCap := o.HTTP.SensorBufferSize
+	if sampleCap <= 0 {
+		sampleCap = 50
+	}
 	p := &Publisher{
 		opts:       o,
 		cancel:     cancel,
@@ -133,6 +171,10 @@ func NewPublisher(parent context.Context, o *Options) (*Publisher, error) {
 		dedupLast:  make(map[string]time.Time),
 		sensorSeen: make(map[string]time.Time),
 		startedAt:  time.Now(),
+		rawLines:   make([]rawLineEntry, 0, rawCap),
+		rawCap:     rawCap,
+		samples:    make([]sensorSample, 0, sampleCap),
+		sampleCap:  sampleCap,
 	}
 	p.lastSensorAt.Store(time.Time{})
 	p.lastSensorHWID.Store("")
@@ -436,7 +478,17 @@ func (p *Publisher) PublishSensor(ctx context.Context, sd *SensorData) error {
 
 	p.published.Add(1)
 	p.clearPending(topicID)
+	p.appendSensorSample(sd, fields)
 	log.Debug("published sensor data", "id", sd.Id, "hwid", sd.Hwid, "fields", len(fields))
+
+	p.sensorHookMu.Lock()
+	sh := p.sensorHook
+	p.sensorHookMu.Unlock()
+	if sh != nil {
+		if b, err := json.Marshal(sd); err == nil {
+			sh(topicID, b)
+		}
+	}
 	return nil
 }
 
@@ -646,6 +698,7 @@ func (p *Publisher) runPublishLoopInner(ctx context.Context, serialCh <-chan str
 }
 
 func (p *Publisher) handleSerialMessage(ctx context.Context, msg string) {
+	p.appendRawLine(msg)
 	if p.isDuplicate(msg) {
 		return
 	}
@@ -732,7 +785,7 @@ func (p *Publisher) reportHealth(ctx context.Context) {
 	}
 }
 
-func (p *Publisher) snapshot() healthSnapshot {
+func (p *Publisher) snapshot() HealthSnapshot {
 	p.pendingMu.Lock()
 	pendingCount := len(p.pending)
 	p.pendingMu.Unlock()
@@ -766,7 +819,7 @@ func (p *Publisher) snapshot() healthSnapshot {
 	}
 	p.sensorSeenMu.Unlock()
 
-	return healthSnapshot{
+	return HealthSnapshot{
 		Version: Version, GitSHA: GitSHA, StartedAt: p.startedAt.Format(time.RFC3339),
 		Status: status, Published: p.published.Load(), PublishFailed: p.publishFailed.Load(),
 		PendingFlushed: p.pendingFlushed.Load(), PendingDropped: p.pendingDropped.Load(),
@@ -952,6 +1005,98 @@ func (p *Publisher) ClearHADiscovery() {
 		"cleared", count,
 	)
 	p.publishHAActuators(p.runCtx)
+}
+
+// Health returns a snapshot identical to the MQTT health topic payload.
+func (p *Publisher) Health() HealthSnapshot {
+	return p.snapshot()
+}
+
+// SensorsLastSeen returns a copy of HWID → last-seen RFC3339 timestamps.
+func (p *Publisher) SensorsLastSeen() map[string]string {
+	p.sensorSeenMu.Lock()
+	defer p.sensorSeenMu.Unlock()
+	out := make(map[string]string, len(p.sensorSeen))
+	for k, t := range p.sensorSeen {
+		out[k] = t.Format(time.RFC3339)
+	}
+	return out
+}
+
+func (p *Publisher) appendRawLine(msg string) {
+	entry := rawLineEntry{At: time.Now().Format(time.RFC3339Nano), Message: msg}
+	if p.rawCap > 0 {
+		p.rawMu.Lock()
+		if len(p.rawLines) >= p.rawCap {
+			copy(p.rawLines, p.rawLines[1:])
+			p.rawLines[len(p.rawLines)-1] = entry
+		} else {
+			p.rawLines = append(p.rawLines, entry)
+		}
+		p.rawMu.Unlock()
+	}
+	p.rawHookMu.Lock()
+	hook := p.rawHook
+	p.rawHookMu.Unlock()
+	if hook != nil {
+		hook(entry)
+	}
+}
+
+// SetRawLineHook registers a callback invoked for every serial line (HTTP WebSocket live feed).
+func (p *Publisher) SetRawLineHook(fn func(rawLineEntry)) {
+	p.rawHookMu.Lock()
+	p.rawHook = fn
+	p.rawHookMu.Unlock()
+}
+
+// SetSensorHook registers a callback after successful sumJson payload build.
+func (p *Publisher) SetSensorHook(fn func(hwid string, sumJSON []byte)) {
+	p.sensorHookMu.Lock()
+	p.sensorHook = fn
+	p.sensorHookMu.Unlock()
+}
+
+// RecentRawLines returns a copy of the recent serial line buffer (oldest first).
+func (p *Publisher) RecentRawLines() []rawLineEntry {
+	p.rawMu.Lock()
+	defer p.rawMu.Unlock()
+	out := make([]rawLineEntry, len(p.rawLines))
+	copy(out, p.rawLines)
+	return out
+}
+
+func (p *Publisher) appendSensorSample(sd *SensorData, fields map[string]string) {
+	if p.sampleCap <= 0 || sd == nil {
+		return
+	}
+	fcopy := make(map[string]string, len(fields))
+	maps.Copy(fcopy, fields)
+	entry := sensorSample{
+		At:     time.Now().Format(time.RFC3339Nano),
+		HWID:   sd.TopicID(),
+		Model:  sd.Model,
+		ID:     sd.Id,
+		Name:   sd.FriendlyName,
+		Fields: fcopy,
+	}
+	p.sampleMu.Lock()
+	defer p.sampleMu.Unlock()
+	if len(p.samples) >= p.sampleCap {
+		copy(p.samples, p.samples[1:])
+		p.samples[len(p.samples)-1] = entry
+		return
+	}
+	p.samples = append(p.samples, entry)
+}
+
+// RecentSensorSamples returns recent published sensor samples (oldest first).
+func (p *Publisher) RecentSensorSamples() []sensorSample {
+	p.sampleMu.Lock()
+	defer p.sampleMu.Unlock()
+	out := make([]sensorSample, len(p.samples))
+	copy(out, p.samples)
+	return out
 }
 
 func (p *Publisher) Disconnect() {

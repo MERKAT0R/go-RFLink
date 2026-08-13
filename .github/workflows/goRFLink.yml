@@ -5,6 +5,10 @@ on:
     branches: [ "master", "main" ]
   pull_request:
     branches: [ "master", "main" ]
+  # Scorecard needs periodic runs for maintained checks / published results
+  schedule:
+    - cron: "30 1 * * 1"
+  branch_protection_rule:
 
 permissions:
   contents: read
@@ -39,3 +43,36 @@ jobs:
 
       - name: Test
         run: go test ./...
+
+  # OpenSSF Scorecard — supply-chain / best-practice checks
+  # https://github.com/ossf/scorecard-action
+  scorecard:
+    name: OpenSSF Scorecard
+    runs-on: ubuntu-latest
+    # Avoid duplicate PR runs from forks without secrets; still runs on push/schedule
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      security-events: write   # upload SARIF to code scanning
+      id-token: write          # publish results to OpenSSF API / badge
+      actions: read            # some checks inspect workflow files
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Run Scorecard
+        uses: ossf/scorecard-action@v2.4.2
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          # Publish for public repos → enables https://api.scorecard.dev badge
+          publish_results: true
+          # Optional: fine-grained PAT only if repo is private
+          # repo_token: ${{ secrets.SCORECARD_TOKEN }}
+
+      - name: Upload SARIF to code scanning
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: results.sarif

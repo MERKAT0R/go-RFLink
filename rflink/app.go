@@ -25,6 +25,11 @@ type App struct {
 	cmdMu       sync.Mutex
 	cmdTokens   float64
 	cmdLastFill time.Time
+
+	httpServer *httpAPIServer
+	runtime    *runtimeManager
+	sessions   *sessionStore
+	webhooks   *webhookManager
 }
 
 // Init creates and starts the RFLink application.
@@ -36,6 +41,11 @@ func Init() (*App, error) {
 
 	initLogger(opts.LogLevel)
 	log.Info("go-rflink starting", "log_level", opts.LogLevel)
+
+	runtimeMgr, err := newRuntimeManager(opts)
+	if err != nil {
+		return nil, fmt.Errorf("runtime config: %w", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -55,6 +65,14 @@ func Init() (*App, error) {
 		cancel:      cancel,
 		cmdTokens:   float64(opts.Publish.CommandRateLimit),
 		cmdLastFill: time.Now(),
+		runtime:     runtimeMgr,
+		sessions:    newSessionStore(),
+	}
+	app.webhooks = newWebhookManager(app)
+	runtimeMgr.onChange = func() {
+		if app.webhooks != nil {
+			app.webhooks.Reload()
+		}
 	}
 
 	if err := publisher.SubscribeCommands(app.handleCommand); err != nil {
@@ -93,10 +111,43 @@ func Init() (*App, error) {
 	)
 	opts.LogMQTTTopics()
 
+	app.publisher.SetRawLineHook(func(e rawLineEntry) {
+		if app.webhooks != nil {
+			app.webhooks.NotifyRaw(e)
+		}
+	})
+	app.publisher.SetSensorHook(func(hwid string, sumJSON []byte) {
+		if app.webhooks != nil {
+			app.webhooks.NotifySumJSON(hwid, sumJSON)
+		}
+	})
+	app.webhooks.Start(ctx)
+
+	if opts.HTTP.Listen != "" {
+		srv, err := startHTTPServer(app)
+		if err != nil {
+			app.Stop()
+			return nil, fmt.Errorf("start http server: %w", err)
+		}
+		app.httpServer = srv
+	} else {
+		log.Info("http server disabled",
+			"api", false,
+			"gui", false,
+			"hint", "set HTTP_LISTEN=127.0.0.1:8080 to enable API/GUI",
+		)
+	}
+
 	return app, nil
 }
 
 func (a *App) handleCommand(payload string) {
+	_ = a.ExecuteCommand(payload)
+}
+
+// ExecuteCommand runs the same normalize / whitelist / rate-limit path as MQTT commands
+// and returns the outcome (also published to cmd/result when MQTT is up).
+func (a *App) ExecuteCommand(payload string) CmdResult {
 	ctx := context.Background()
 	now := time.Now().Format(time.RFC3339Nano)
 
@@ -104,49 +155,46 @@ func (a *App) handleCommand(payload string) {
 	if err != nil {
 		a.publisher.IncCommandRejected()
 		log.Warn("rflink command rejected by normalization", "command", payload, "err", err)
-		a.publisher.PublishCmdResult(ctx, CmdResult{
-			Command: payload, Status: "rejected", Error: err.Error(), ReceivedAt: now,
-		})
-		return
+		res := CmdResult{Command: payload, Status: "rejected", Error: err.Error(), ReceivedAt: now}
+		a.publisher.PublishCmdResult(ctx, res)
+		return res
 	}
 
 	if !a.opts.CommandAllowed(cmd) {
 		a.publisher.IncCommandRejected()
 		log.Warn("rflink command rejected by whitelist", "command", cmd)
-		a.publisher.PublishCmdResult(ctx, CmdResult{
-			Command: cmd, Status: "rejected", ReceivedAt: now,
-		})
-		return
+		res := CmdResult{Command: cmd, Status: "rejected", ReceivedAt: now}
+		a.publisher.PublishCmdResult(ctx, res)
+		return res
 	}
 	payload = cmd
 
 	if !a.allowCommand() {
 		a.publisher.IncCommandRateLimited()
 		log.Warn("rflink command rate-limited", "command", payload)
-		a.publisher.PublishCmdResult(ctx, CmdResult{
-			Command: payload, Status: "rate_limited", ReceivedAt: now,
-		})
-		return
+		lim, rem, _ := a.CommandRateStatus()
+		res := CmdResult{Command: payload, Status: "rate_limited", ReceivedAt: now, RateLimitRemaining: rem, RateLimitPerSec: lim}
+		a.publisher.PublishCmdResult(ctx, res)
+		return res
 	}
 
 	if err := a.serial.Write(payload); err != nil {
 		if errors.Is(err, errSerialNotConnected) {
 			log.Warn("rflink command skipped, serial not connected", "command", payload)
-			a.publisher.PublishCmdResult(ctx, CmdResult{
-				Command: payload, Status: "serial_down", Error: err.Error(), ReceivedAt: now,
-			})
-			return
+			res := CmdResult{Command: payload, Status: "serial_down", Error: err.Error(), ReceivedAt: now}
+			a.publisher.PublishCmdResult(ctx, res)
+			return res
 		}
 		log.Error("failed to send rflink command", "command", payload, "err", err)
-		a.publisher.PublishCmdResult(ctx, CmdResult{
-			Command: payload, Status: "error", Error: err.Error(), ReceivedAt: now,
-		})
-		return
+		res := CmdResult{Command: payload, Status: "error", Error: err.Error(), ReceivedAt: now}
+		a.publisher.PublishCmdResult(ctx, res)
+		return res
 	}
 	log.Info("rflink command sent", "command", payload)
-	a.publisher.PublishCmdResult(ctx, CmdResult{
-		Command: payload, Status: "ok", ReceivedAt: now,
-	})
+	lim, rem, _ := a.CommandRateStatus()
+	res := CmdResult{Command: payload, Status: "ok", ReceivedAt: now, RateLimitRemaining: rem, RateLimitPerSec: lim}
+	a.publisher.PublishCmdResult(ctx, res)
+	return res
 }
 
 func (a *App) allowCommand() bool {
@@ -156,19 +204,33 @@ func (a *App) allowCommand() bool {
 	}
 	a.cmdMu.Lock()
 	defer a.cmdMu.Unlock()
+	a.refillCmdTokensLocked(time.Now(), limit)
+	if a.cmdTokens < 1 {
+		return false
+	}
+	a.cmdTokens--
+	return true
+}
 
-	now := time.Now()
+func (a *App) refillCmdTokensLocked(now time.Time, limit int) {
 	elapsed := now.Sub(a.cmdLastFill).Seconds()
 	a.cmdLastFill = now
 	a.cmdTokens += elapsed * float64(limit)
 	if a.cmdTokens > float64(limit) {
 		a.cmdTokens = float64(limit)
 	}
-	if a.cmdTokens < 1 {
-		return false
+}
+
+// CommandRateStatus returns the configured rate limit and approximate remaining tokens.
+func (a *App) CommandRateStatus() (limit int, remaining float64, unlimited bool) {
+	limit = a.opts.Publish.CommandRateLimit
+	if limit <= 0 {
+		return 0, 0, true
 	}
-	a.cmdTokens--
-	return true
+	a.cmdMu.Lock()
+	defer a.cmdMu.Unlock()
+	a.refillCmdTokensLocked(time.Now(), limit)
+	return limit, a.cmdTokens, false
 }
 
 func (a *App) runSerialLoop(ctx context.Context) {
@@ -324,6 +386,16 @@ func (a *App) Stop() {
 	a.cancel()
 	a.wg.Wait()
 
+	if a.httpServer != nil {
+		a.httpServer.Shutdown()
+		a.httpServer = nil
+	}
+	if a.webhooks != nil {
+		a.webhooks.Stop()
+	}
+	if a.runtime != nil {
+		a.runtime.Stop()
+	}
 	if a.publisher != nil {
 		a.publisher.Disconnect()
 	}
