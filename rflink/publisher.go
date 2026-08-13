@@ -435,7 +435,7 @@ func (p *Publisher) PublishSensor(ctx context.Context, sd *SensorData) error {
 	}
 	sd.ApplyCanonicalHWID(p.opts)
 	if p.opts.SensorIgnored(sd.Model, sd.Hwid) || p.opts.SensorIgnored(sd.Model, sd.Id) {
-		log.Debug("ignored sensor by ignore-list", "model", sd.Model, "hwid", sd.Hwid, "id", sd.Id)
+		log.Info("ignored sensor by ignore-list", "model", sd.Model, "hwid", sd.Hwid, "id", sd.Id)
 		return nil
 	}
 	p.applyFriendlyName(sd)
@@ -446,7 +446,7 @@ func (p *Publisher) PublishSensor(ctx context.Context, sd *SensorData) error {
 
 	fields := sd.FieldsForPublish(p.opts.temperatureUnit())
 	if len(fields) == 0 {
-		log.Debug("sensor message has no publishable fields", "id", sd.Id, "hwid", sd.Hwid, "model", sd.Model)
+		log.Info("sensor message has no publishable fields", "id", sd.Id, "hwid", sd.Hwid, "model", sd.Model)
 	}
 	if p.opts.Publish.HomeAssistantDiscovery {
 		p.publishHomeAssistantDiscovery(ctx, sd, fields)
@@ -479,7 +479,7 @@ func (p *Publisher) PublishSensor(ctx context.Context, sd *SensorData) error {
 	p.published.Add(1)
 	p.clearPending(topicID)
 	p.appendSensorSample(sd, fields)
-	log.Debug("published sensor data", "id", sd.Id, "hwid", sd.Hwid, "fields", len(fields))
+	log.Info("published sensor data", "id", sd.Id, "hwid", sd.Hwid, "fields", len(fields))
 
 	p.sensorHookMu.Lock()
 	sh := p.sensorHook
