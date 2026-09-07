@@ -1,7 +1,7 @@
 [![CI](https://github.com/MERKAT0R/go-RFLink/actions/workflows/goRFLink.yml/badge.svg)](https://github.com/MERKAT0R/go-RFLink/actions/workflows/goRFLink.yml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/MERKAT0R/go-RFLink/badge)](https://scorecard.dev/viewer/?uri=github.com/MERKAT0R/go-RFLink)
 [![Go Version](https://img.shields.io/github/go-mod/go-version/MERKAT0R/go-RFLink)](https://github.com/MERKAT0R/go-RFLink)
-[![golangci-lint](https://img.shields.io/badge/golangci--lint-v2.12.2-fedcba?logo=go&logoColor=white)](https://github.com/MERKAT0R/go-RFLink/actions/workflows/goRFLink.yml)
+[![golangci-lint](https://img.shields.io/badge/golangci--lint-v2.13.1-fedcba?logo=go&logoColor=white)](https://github.com/MERKAT0R/go-RFLink/actions/workflows/goRFLink.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/MERKAT0R/go-RFLink/rflink.svg)](https://pkg.go.dev/github.com/MERKAT0R/go-RFLink/rflink)
 [![Docker](https://img.shields.io/badge/Docker-GHCR-2496ED?logo=docker&logoColor=white)](https://github.com/MERKAT0R/go-RFLink/pkgs/container/go-rflink)
 [![Latest Release](https://img.shields.io/github/v/release/MERKAT0R/go-RFLink?include_prereleases)](https://github.com/MERKAT0R/go-RFLink/releases)
