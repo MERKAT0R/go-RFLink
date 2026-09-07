@@ -239,41 +239,39 @@ func NewPublisher(parent context.Context, o *Options) (*Publisher, error) {
 			p.mqttUp.Store(false)
 			log.Warn("mqtt connect error", "err", err)
 		},
-		ClientConfig: paho.ClientConfig{
-			ClientID: o.Publish.ClientID,
-			OnClientError: func(err error) {
-				p.mqttUp.Store(false)
-				log.Warn("mqtt client error", "err", err)
-			},
-			OnServerDisconnect: func(d *paho.Disconnect) {
-				p.mqttUp.Store(false)
-				if d.Properties != nil && d.Properties.ReasonString != "" {
-					log.Warn("mqtt server disconnect", "reason", d.Properties.ReasonString, "code", d.ReasonCode)
-				} else {
-					log.Warn("mqtt server disconnect", "code", d.ReasonCode)
-				}
-			},
-			OnPublishReceived: []func(paho.PublishReceived) (bool, error){
-				func(pr paho.PublishReceived) (bool, error) {
-					if pr.Packet == nil {
-						return true, nil
-					}
-					topic := pr.Packet.Topic
-					payload := string(pr.Packet.Payload)
-					if topic == p.opts.haRediscoverTopic() {
-						p.ClearHADiscovery()
-						return true, nil
-					}
-					if topic == p.opts.Publish.CmdTopic {
-						p.cmdMu.Lock()
-						handler := p.cmdHandler
-						p.cmdMu.Unlock()
-						if handler != nil {
-							handler(payload)
-						}
-					}
+		ClientID: o.Publish.ClientID,
+		OnClientError: func(err error) {
+			p.mqttUp.Store(false)
+			log.Warn("mqtt client error", "err", err)
+		},
+		OnServerDisconnect: func(d *paho.Disconnect) {
+			p.mqttUp.Store(false)
+			if d.Properties != nil && d.Properties.ReasonString != "" {
+				log.Warn("mqtt server disconnect", "reason", d.Properties.ReasonString, "code", d.ReasonCode)
+			} else {
+				log.Warn("mqtt server disconnect", "code", d.ReasonCode)
+			}
+		},
+		OnPublishReceived: []func(paho.PublishReceived) (bool, error){
+			func(pr paho.PublishReceived) (bool, error) {
+				if pr.Packet == nil {
 					return true, nil
-				},
+				}
+				topic := pr.Packet.Topic
+				payload := string(pr.Packet.Payload)
+				if topic == p.opts.haRediscoverTopic() {
+					p.ClearHADiscovery()
+					return true, nil
+				}
+				if topic == p.opts.Publish.CmdTopic {
+					p.cmdMu.Lock()
+					handler := p.cmdHandler
+					p.cmdMu.Unlock()
+					if handler != nil {
+						handler(payload)
+					}
+				}
+				return true, nil
 			},
 		},
 	}
