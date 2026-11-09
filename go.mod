@@ -3,7 +3,7 @@ module github.com/MERKAT0R/go-rflink
 go 1.27.1
 
 require (
-	github.com/caarlos0/env/v11 v11.4.1
+	github.com/caarlos0/env/v11 v11.4.2
 	github.com/eclipse/paho.golang v0.23.0
 	github.com/goccy/go-json v0.11.1
 	github.com/gorilla/websocket v1.5.3
