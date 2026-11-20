@@ -113,7 +113,7 @@ services:
   # Optional local broker for testing. Point PUBLISH_HOST at your
   # production broker and remove this service + depends_on if unused.
   mosquitto:
-    image: eclipse-mosquitto:2
+    image: eclipse-mosquitto:2.0.23
     container_name: go-rflink-mosquitto
     restart: unless-stopped
     ports:

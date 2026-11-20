@@ -10,17 +10,21 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/goccy/go-json"
 )
+
+var errWebhookInvalid = errors.New("invalid webhook")
 
 const (
 	maxWebhooks           = 8
@@ -59,9 +63,11 @@ type webhookManager struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	client   *http.Client
-	pushSem  chan struct{} // limits concurrent outbound push HTTP calls
-	reloadMu sync.Mutex    // serializes Reload
+	client    *http.Client
+	pushSem   chan struct{} // limits concurrent outbound push HTTP calls
+	reloadMu  sync.Mutex    // serializes Reload and Stop
+	reloadGen uint64
+	stopped   bool
 }
 
 const maxConcurrentPush = 8
@@ -72,20 +78,48 @@ func newWebhookManager(app *App) *webhookManager {
 		pushSem: make(chan struct{}, maxConcurrentPush),
 		client: &http.Client{
 			// Timeout overridden per-request via context.
-			Timeout: 0,
+			Timeout:   0,
+			Transport: webhookTransport(),
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				if len(via) >= 3 {
 					return fmt.Errorf("too many redirects")
 				}
-				// Re-validate each hop (SSRF via redirect).
 				if err := validateWebhookURL(req.URL.String()); err != nil {
 					return err
 				}
-				return validateWebhookURLResolved(req.URL.String())
+				if len(via) > 0 && webhookRedirectStripsSecrets(via[0], req) {
+					ua := req.Header.Get("User-Agent")
+					accept := req.Header.Get("Accept")
+					req.Header = make(http.Header)
+					if ua != "" {
+						req.Header.Set("User-Agent", ua)
+					}
+					if accept != "" {
+						req.Header.Set("Accept", accept)
+					}
+					// 307/308 replay the body. Do not carry a POST payload onto
+					// another host or down from https to http.
+					req.Body = http.NoBody
+					req.GetBody = nil
+					req.ContentLength = 0
+				}
+				return nil
 			},
 		},
 	}
 	return m
+}
+
+// webhookRedirectStripsSecrets reports a hop that must not keep custom
+// headers or a POST body: a different host, or https downgraded to http.
+func webhookRedirectStripsSecrets(from, to *http.Request) bool {
+	if from == nil || to == nil || from.URL == nil || to.URL == nil {
+		return true
+	}
+	if !strings.EqualFold(from.URL.Host, to.URL.Host) {
+		return true
+	}
+	return strings.EqualFold(from.URL.Scheme, "https") && !strings.EqualFold(to.URL.Scheme, "https")
 }
 
 func (m *webhookManager) Start(parent context.Context) {
@@ -93,32 +127,53 @@ func (m *webhookManager) Start(parent context.Context) {
 }
 
 func (m *webhookManager) Stop() {
-	m.mu.Lock()
-	if m.cancel != nil {
-		m.cancel()
-		m.cancel = nil
+	m.reloadMu.Lock()
+	m.stopped = true
+	cancel := m.cancel
+	m.cancel = nil
+	m.reloadMu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
-	m.mu.Unlock()
 	m.wg.Wait()
 }
 
 // Reload rebuilds workers from current opts.webhooks (env/runtime applied).
+// The lock is not held while workers drain: a poll blocked in serial Write
+// must not keep Stop from cancelling the rest of the set.
 func (m *webhookManager) Reload() {
 	m.reloadMu.Lock()
-	defer m.reloadMu.Unlock()
-
-	m.mu.Lock()
-	if m.cancel != nil {
-		m.cancel()
-		m.cancel = nil
+	if m.stopped {
+		m.reloadMu.Unlock()
+		return
 	}
-	m.mu.Unlock()
+	m.reloadGen++
+	gen := m.reloadGen
+	cancel := m.cancel
+	m.cancel = nil
+	m.reloadMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	m.wg.Wait()
 
-	m.mu.Lock()
+	m.reloadMu.Lock()
+	defer m.reloadMu.Unlock()
+	if m.stopped || gen != m.reloadGen {
+		return
+	}
+
+	m.app.opts.runtimeMu.RLock()
 	hooks := append([]RuntimeWebhook{}, m.app.opts.webhooks...)
+	m.app.opts.runtimeMu.RUnlock()
+
+	parent := context.Background()
+	if m.app.ctx != nil {
+		parent = m.app.ctx
+	}
+	ctx, cancel := context.WithCancel(parent)
+	m.mu.Lock()
 	m.hooks = hooks
-	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 	m.mu.Unlock()
 
@@ -160,7 +215,7 @@ func (m *webhookManager) runPoll(ctx context.Context, h RuntimeWebhook) {
 		}
 	}()
 
-	interval := max(h.IntervalSec, minPollIntervalSec)
+	interval := min(max(h.IntervalSec, minPollIntervalSec), 86400)
 	timeout := h.TimeoutSec
 	if timeout <= 0 {
 		timeout = defaultHookTimeoutSec
@@ -202,17 +257,17 @@ func (m *webhookManager) doPollOnce(ctx context.Context, h RuntimeWebhook, metho
 		}
 	}()
 
+	reqCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+
 	if err := validateWebhookURL(h.URL); err != nil {
 		log.Warn("webhook poll skipped: bad url", "name", h.Name, "err", err)
 		return
 	}
-	if err := validateWebhookURLResolved(h.URL); err != nil {
+	if err := validateWebhookURLResolved(reqCtx, h.URL); err != nil {
 		log.Warn("webhook poll blocked after resolve", "name", h.Name, "err", err)
 		return
 	}
-
-	reqCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
-	defer cancel()
 
 	var body io.Reader
 	if method == http.MethodPost {
@@ -266,7 +321,6 @@ func (m *webhookManager) doPollOnce(ctx context.Context, h RuntimeWebhook, metho
 		return
 	}
 
-	log.Info("webhook poll command", "name", h.Name, "command", text)
 	res := m.app.ExecuteCommand(text)
 	if res.Status != "ok" {
 		log.Warn("webhook poll command not ok", "name", h.Name, "status", res.Status, "error", res.Error)
@@ -385,7 +439,7 @@ func (m *webhookManager) doPush(h RuntimeWebhook, body []byte, contentType strin
 			log.Warn("webhook push GET url too long after payload", "name", h.Name, "len", len(expanded), "max", maxGETURLLen)
 			return
 		}
-		if err := validateWebhookURL(stripWebhookPlaceholders(expanded)); err != nil {
+		if err := validateWebhookURLLimit(stripWebhookPlaceholders(expanded), maxGETURLLen); err != nil {
 			log.Warn("webhook push GET url invalid after expand", "name", h.Name, "err", err)
 			return
 		}
@@ -403,7 +457,7 @@ func (m *webhookManager) doPush(h RuntimeWebhook, body []byte, contentType strin
 		}
 		rdr = bytes.NewReader(body)
 	}
-	if err := validateWebhookURLResolved(u); err != nil {
+	if err := validateWebhookURLResolvedLimit(ctx, u, maxGETURLLen); err != nil {
 		log.Warn("webhook push blocked after resolve", "name", h.Name, "err", err)
 		return
 	}
@@ -436,11 +490,13 @@ func (m *webhookManager) doPush(h RuntimeWebhook, body []byte, contentType strin
 }
 
 // webhook placeholders for GET/POST URL templates.
+// Longer tokens must be replaced before shorter ones: "{payload}" is a substring of "{{payload}}".
 var webhookPlaceholders = []string{
+	"{{payload}}",
 	"%payload%", "%PAYLOAD%",
 	"%raw%", "%RAW%",
 	"%json%", "%JSON%",
-	"{payload}", "{{payload}}",
+	"{payload}",
 }
 
 func webhookURLHasPlaceholder(u string) bool {
@@ -452,9 +508,15 @@ func webhookURLHasPlaceholder(u string) bool {
 	return false
 }
 
+func webhookPlaceholdersLongestFirst() []string {
+	phs := append([]string(nil), webhookPlaceholders...)
+	sort.Slice(phs, func(i, j int) bool { return len(phs[i]) > len(phs[j]) })
+	return phs
+}
+
 func stripWebhookPlaceholders(u string) string {
 	out := u
-	for _, ph := range webhookPlaceholders {
+	for _, ph := range webhookPlaceholdersLongestFirst() {
 		out = strings.ReplaceAll(out, ph, "x")
 	}
 	return out
@@ -463,10 +525,35 @@ func stripWebhookPlaceholders(u string) string {
 func expandWebhookPlaceholders(template string, body []byte) (string, error) {
 	enc := url.QueryEscape(string(body))
 	out := template
-	for _, ph := range webhookPlaceholders {
+	for _, ph := range webhookPlaceholdersLongestFirst() {
 		out = strings.ReplaceAll(out, ph, enc)
 	}
+	if err := webhookExpandedKeepsTarget(template, out); err != nil {
+		return "", err
+	}
 	return out, nil
+}
+
+// webhookExpandedKeepsTarget rejects a substitution that changes host or adds a
+// path segment. QueryEscape keeps "/" as %2F; a broken replacement (raw braces)
+// makes url.URL re-decode that into a real slash.
+func webhookExpandedKeepsTarget(template, expanded string) error {
+	base, err := url.Parse(stripWebhookPlaceholders(template))
+	if err != nil {
+		return fmt.Errorf("webhook template: %w", err)
+	}
+	got, err := url.Parse(expanded)
+	if err != nil {
+		return fmt.Errorf("webhook url: %w", err)
+	}
+	if got.User != nil || !strings.EqualFold(base.Scheme, got.Scheme) ||
+		!strings.EqualFold(base.Hostname(), got.Hostname()) || base.Port() != got.Port() {
+		return fmt.Errorf("webhook url target changed after payload substitution")
+	}
+	if strings.Count(base.EscapedPath(), "/") != strings.Count(got.EscapedPath(), "/") {
+		return fmt.Errorf("webhook url path changed after payload substitution")
+	}
+	return nil
 }
 
 // expandWebhookGETURL substitutes %payload%/%raw%/%json%/{payload} or, if none present,
@@ -495,11 +582,18 @@ func expandWebhookGETURL(template, payloadKind string, body []byte) (string, err
 // --- validation / SSRF ---
 
 func validateWebhookURL(raw string) error {
+	return validateWebhookURLLimit(raw, maxHookURLLen)
+}
+
+func validateWebhookURLLimit(raw string, maxLen int) error {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return fmt.Errorf("empty url")
 	}
-	if len(raw) > maxHookURLLen {
+	if maxLen <= 0 {
+		maxLen = maxHookURLLen
+	}
+	if len(raw) > maxLen {
 		return fmt.Errorf("url too long")
 	}
 	// %payload% etc. are not valid percent-encoding — strip before parse.
@@ -555,11 +649,54 @@ func rejectDangerousIP(ip net.IP) error {
 	if ip.IsMulticast() || ip.IsUnspecified() {
 		return fmt.Errorf("invalid ip")
 	}
-	// AWS/GCP/Azure metadata
-	if ip.Equal(net.ParseIP("169.254.169.254")) || ip.Equal(net.ParseIP("169.254.170.2")) {
+	// AWS/GCP/Azure metadata, including the IPv6 IMDS address (a ULA, so IsPrivate is true).
+	if ip.Equal(net.ParseIP("169.254.169.254")) ||
+		ip.Equal(net.ParseIP("169.254.170.2")) ||
+		ip.Equal(net.ParseIP("fd00:ec2::254")) {
 		return fmt.Errorf("metadata address not allowed")
 	}
 	return nil
+}
+
+func webhookTransport() *http.Transport {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok || base == nil {
+		return &http.Transport{Proxy: nil, DialContext: webhookDialContext}
+	}
+	tr := base.Clone()
+	tr.Proxy = nil
+	tr.DialContext = webhookDialContext
+	return tr
+}
+
+// webhookDialContext connects only to addresses checked in this call.
+// A second DNS lookup inside net/http would reopen a rebinding window.
+func webhookDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	var last error
+	dialer := net.Dialer{Timeout: 10 * time.Second}
+	for _, ipa := range ips {
+		if err := rejectDangerousIP(ipa.IP); err != nil {
+			last = err
+			continue
+		}
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ipa.IP.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		last = err
+	}
+	if last == nil {
+		last = fmt.Errorf("no allowed address for %s", host)
+	}
+	return nil, last
 }
 
 func isLocalLabHost(host string) bool {
@@ -573,8 +710,12 @@ func isLocalLabHost(host string) bool {
 
 // validateWebhookURLResolved looks up DNS and rejects dangerous IPs (metadata/loopback).
 // Mitigates DNS-rebinding SSRF between config time and request time.
-func validateWebhookURLResolved(raw string) error {
-	if err := validateWebhookURL(raw); err != nil {
+func validateWebhookURLResolved(ctx context.Context, raw string) error {
+	return validateWebhookURLResolvedLimit(ctx, raw, maxHookURLLen)
+}
+
+func validateWebhookURLResolvedLimit(ctx context.Context, raw string, maxLen int) error {
+	if err := validateWebhookURLLimit(raw, maxLen); err != nil {
 		return err
 	}
 	u, err := url.Parse(stripWebhookPlaceholders(strings.TrimSpace(raw)))
@@ -588,19 +729,42 @@ func validateWebhookURLResolved(raw string) error {
 	if ip := net.ParseIP(host); ip != nil {
 		return rejectDangerousIP(ip)
 	}
-	ips, err := net.LookupIP(host)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	lookupCtx, lookupCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer lookupCancel()
+	addrs, err := net.DefaultResolver.LookupIPAddr(lookupCtx, host)
 	if err != nil {
 		return fmt.Errorf("dns lookup: %w", err)
 	}
-	if len(ips) == 0 {
+	if len(addrs) == 0 {
 		return fmt.Errorf("dns lookup: no addresses")
 	}
-	for _, ip := range ips {
-		if err := rejectDangerousIP(ip); err != nil {
-			return fmt.Errorf("resolved %s → %s: %w", host, ip, err)
+	for _, ipa := range addrs {
+		if err := rejectDangerousIP(ipa.IP); err != nil {
+			return fmt.Errorf("resolved %s → %s: %w", host, ipa.IP, err)
 		}
 	}
 	return nil
+}
+
+// sanitizeRuntimeWebhooks drops invalid entries and caps the list.
+// The result is never nil when the caller already decided runtime owns the key.
+func sanitizeRuntimeWebhooks(list []RuntimeWebhook) []RuntimeWebhook {
+	out := make([]RuntimeWebhook, 0, len(list))
+	for i := range list {
+		h := list[i]
+		if err := ValidateWebhookConfig(&h); err != nil {
+			log.Warn("runtime webhook skipped", "name", h.Name, "err", err)
+			continue
+		}
+		out = append(out, h)
+		if len(out) >= maxWebhooks {
+			break
+		}
+	}
+	return stabilizeWebhookIDs(out, nil)
 }
 
 // ValidateWebhookConfig validates a webhook before save.
@@ -677,12 +841,53 @@ func ValidateWebhookConfig(h *RuntimeWebhook) error {
 	return nil
 }
 
+var (
+	webhookIDMu  sync.Mutex
+	webhookIDSeq uint64
+)
+
 func newWebhookID() string {
 	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("%d", time.Now().UnixNano())
+	if _, err := rand.Read(b); err == nil {
+		return hex.EncodeToString(b)
 	}
-	return hex.EncodeToString(b)
+	webhookIDMu.Lock()
+	webhookIDSeq++
+	n := webhookIDSeq
+	webhookIDMu.Unlock()
+	return fmt.Sprintf("id-%d-%d", time.Now().UnixNano(), n)
+}
+
+// stabilizeWebhookIDs fills empty ids, keeps an id already issued for the same
+// name, and gives a duplicate id its own value so update/delete can address it.
+func stabilizeWebhookIDs(list, prev []RuntimeWebhook) []RuntimeWebhook {
+	byName := make(map[string]string, len(prev))
+	for _, h := range prev {
+		name := strings.ToLower(strings.TrimSpace(h.Name))
+		if name == "" || h.ID == "" {
+			continue
+		}
+		if _, ok := byName[name]; !ok {
+			byName[name] = h.ID
+		}
+	}
+	used := make(map[string]struct{}, len(list))
+	for i := range list {
+		name := strings.ToLower(strings.TrimSpace(list[i].Name))
+		if id, ok := byName[name]; ok {
+			list[i].ID = id
+			delete(byName, name)
+		}
+		if list[i].ID == "" {
+			list[i].ID = newWebhookID()
+		}
+		if _, ok := used[list[i].ID]; ok {
+			log.Warn("webhook duplicate id reassigned", "name", list[i].Name, "id", list[i].ID)
+			list[i].ID = newWebhookID()
+		}
+		used[list[i].ID] = struct{}{}
+	}
+	return list
 }
 
 func parseWebhooksJSON(raw string) []RuntimeWebhook {
@@ -702,15 +907,57 @@ func parseWebhooksJSON(raw string) []RuntimeWebhook {
 			log.Warn("WEBHOOKS_JSON skip invalid entry", "name", h.Name, "err", err)
 			continue
 		}
-		if h.ID == "" {
-			h.ID = newWebhookID()
-		}
 		out = append(out, h)
 		if len(out) >= maxWebhooks {
 			break
 		}
 	}
 	return out
+}
+
+// mergeWebhookUpdate applies only the JSON keys that were present. An omitted
+// enabled flag stays as stored, and an empty headers object keeps secrets.
+func mergeWebhookUpdate(existing RuntimeWebhook, raw map[string]json.RawMessage, incoming RuntimeWebhook) (RuntimeWebhook, error) {
+	merged := existing
+	if _, ok := raw["name"]; ok {
+		merged.Name = incoming.Name
+	}
+	if _, ok := raw["url"]; ok {
+		merged.URL = incoming.URL
+	}
+	if _, ok := raw["kind"]; ok {
+		merged.Kind = incoming.Kind
+	}
+	if _, ok := raw["method"]; ok {
+		merged.Method = incoming.Method
+	}
+	if _, ok := raw["enabled"]; ok {
+		merged.Enabled = incoming.Enabled
+	}
+	if _, ok := raw["interval_sec"]; ok {
+		merged.IntervalSec = incoming.IntervalSec
+	}
+	if _, ok := raw["timeout_sec"]; ok {
+		merged.TimeoutSec = incoming.TimeoutSec
+	}
+	if _, ok := raw["max_response_bytes"]; ok {
+		merged.MaxResponseBytes = incoming.MaxResponseBytes
+	}
+	if _, ok := raw["payload"]; ok {
+		merged.Payload = incoming.Payload
+	}
+	if hdr, ok := raw["headers"]; ok {
+		trimmed := bytes.TrimSpace(hdr)
+		if len(trimmed) > 0 && string(trimmed) != "{}" && string(trimmed) != "null" {
+			merged.Headers = incoming.Headers
+		}
+	}
+	merged.ID = existing.ID
+	merged.CreatedAt = existing.CreatedAt
+	if err := ValidateWebhookConfig(&merged); err != nil {
+		return RuntimeWebhook{}, fmt.Errorf("%w: %s", errWebhookInvalid, err.Error())
+	}
+	return merged, nil
 }
 
 func webhooksPublicView(list []RuntimeWebhook) []map[string]any {

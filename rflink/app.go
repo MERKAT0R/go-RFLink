@@ -19,6 +19,7 @@ type App struct {
 	publisher *Publisher
 	serial    *SerialReader
 	serialCh  chan string
+	ctx       context.Context
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
 
@@ -62,6 +63,7 @@ func Init() (*App, error) {
 		publisher:   publisher,
 		serial:      serialReader,
 		serialCh:    newSerialChannel(),
+		ctx:         ctx,
 		cancel:      cancel,
 		cmdTokens:   float64(opts.Publish.CommandRateLimit),
 		cmdLastFill: time.Now(),
@@ -72,6 +74,12 @@ func Init() (*App, error) {
 	runtimeMgr.onChange = func() {
 		if app.webhooks != nil {
 			app.webhooks.Reload()
+		}
+		if app.runtime.consumeHAChanged() && app.publisher != nil {
+			app.publisher.ClearHADiscovery()
+			if err := app.publisher.Resubscribe(); err != nil {
+				log.Warn("mqtt resubscribe after ha change failed", "err", err)
+			}
 		}
 	}
 
@@ -150,6 +158,10 @@ func (a *App) handleCommand(payload string) {
 func (a *App) ExecuteCommand(payload string) CmdResult {
 	ctx := context.Background()
 	now := time.Now().Format(time.RFC3339Nano)
+	if a.ctx != nil && a.ctx.Err() != nil {
+		log.Info("rflink command skipped, shutting down", "command", payload)
+		return CmdResult{Command: payload, Status: "stopping", Error: "shutting down", ReceivedAt: now}
+	}
 
 	cmd, err := a.opts.NormalizeCommand(payload)
 	if err != nil {
@@ -256,16 +268,42 @@ func (a *App) runSerialSession(
 	minDelay, maxDelay time.Duration,
 ) (continueLoop bool) {
 	defer func() {
-		if recovered := recover(); recovered != nil {
-			if a.publisher != nil {
-				a.publisher.panics.Add(1)
-			}
-			log.Error("serial session panic recovered", "panic", recovered)
-			a.serial.disconnect()
-			a.publisher.SetSerialConnected(ctx, false)
-			continueLoop = true
+		recovered := recover()
+		if recovered == nil {
+			return
 		}
+		if a.publisher != nil {
+			a.publisher.panics.Add(1)
+		}
+		log.Error("serial session panic recovered", "panic", recovered)
+		if a.serial != nil {
+			a.serial.disconnect()
+		}
+		if a.publisher != nil {
+			a.publisher.SetSerialConnected(ctx, false)
+		}
+		// Back off. Returning immediately would tight-loop a repeating panic.
+		if !sleepContext(ctx, *reconnectDelay) {
+			continueLoop = false
+			return
+		}
+		*reconnectDelay = nextBackoff(*reconnectDelay, minDelay, maxDelay)
+		continueLoop = true
 	}()
+
+	// A previous close was skipped because a Write was still inside the driver.
+	// Do not start another Read on that port, and do not Close during the Write.
+	if a.serial != nil && !a.serial.WritesAllowed() {
+		if err := a.serial.CloseIfIdle(serialCloseWait); err != nil {
+			log.Warn("serial close still waiting for the driver", "err", err, "retry_in", *reconnectDelay)
+			if !sleepContext(ctx, *reconnectDelay) {
+				return false
+			}
+			*reconnectDelay = nextBackoff(*reconnectDelay, minDelay, maxDelay)
+			return true
+		}
+		a.serial.ResumeWrites()
+	}
 
 	if !a.serial.IsConnected() {
 		if err := a.serial.Reconnect(); err != nil {
@@ -286,7 +324,6 @@ func (a *App) runSerialSession(
 			"device", a.opts.Serial.Device,
 			"baud", a.opts.Serial.Baud,
 		)
-		*reconnectDelay = minDelay
 	}
 
 	// Always publish serial online when the port is open (including initial open from NewSerialReader).
@@ -297,9 +334,30 @@ func (a *App) runSerialSession(
 		}
 	}
 
-	err := a.serial.ReadLines(ctx, func(line string) error {
+	sessionCtx, sessionCancel := context.WithCancel(ctx)
+	defer sessionCancel()
+	if a.publisher != nil && a.publisher.serialRestart != nil {
+		a.publisher.DrainSerialRestart()
+		a.publisher.ResetPingState()
+		restart := a.publisher.serialRestart
+		go func() {
+			select {
+			case <-ctx.Done():
+			case <-sessionCtx.Done():
+			case <-restart:
+				sessionCancel()
+			}
+		}()
+	}
+
+	sessionStart := time.Now()
+	err := a.serial.ReadLines(sessionCtx, func(line string) error {
 		log.Debug("serial raw message", "message", line)
 		a.publisher.NoteSerialActivity()
+		// PONG must be counted even when the publish queue is full.
+		if info, perr := ParseGatewayMessage(line); perr == nil && info != nil && info.Pong {
+			a.publisher.NotePong()
+		}
 
 		select {
 		case <-ctx.Done():
@@ -317,18 +375,42 @@ func (a *App) runSerialSession(
 		return false
 	}
 
-	a.serial.disconnect()
-	a.publisher.SetSerialConnected(ctx, false)
-
-	switch {
-	case errors.Is(err, errSerialNotConnected):
-		log.Warn("serial disconnected, reconnecting", "retry_in", *reconnectDelay)
-	case errors.Is(err, errSerialStreamClosed):
-		log.Warn("serial stream closed, reconnecting", "retry_in", *reconnectDelay)
-	default:
-		log.Warn("serial read error, reconnecting", "err", err, "retry_in", *reconnectDelay)
+	unresponsive := sessionCtx.Err() != nil
+	a.serial.PauseWrites()
+	if a.publisher != nil {
+		a.publisher.SetSerialConnected(ctx, false)
+		// A reopened port must collect a fresh run of missed PONGs.
+		a.publisher.ResetPingState()
+		a.publisher.DrainSerialRestart()
+	}
+	if unresponsive {
+		log.Warn("RFLink unresponsive, reopening serial port", "retry_in", *reconnectDelay)
+	} else {
+		switch {
+		case errors.Is(err, errSerialNotConnected):
+			log.Warn("serial disconnected, reconnecting", "retry_in", *reconnectDelay)
+		case errors.Is(err, errSerialStreamClosed):
+			log.Warn("serial stream closed, reconnecting", "retry_in", *reconnectDelay)
+		default:
+			log.Warn("serial read error, reconnecting", "err", err, "retry_in", *reconnectDelay)
+		}
 	}
 
+	if cerr := a.serial.CloseIfIdle(serialCloseWait); cerr != nil {
+		log.Warn("serial close skipped, write still in the driver", "err", cerr, "retry_in", *reconnectDelay)
+		if !sleepContext(ctx, *reconnectDelay) {
+			return false
+		}
+		*reconnectDelay = nextBackoff(*reconnectDelay, minDelay, maxDelay)
+		return true
+	}
+	a.serial.ResumeWrites()
+
+	// A port that opens and then fails the read immediately must keep growing
+	// the delay. Reset only after a session that actually stayed up.
+	if minDelay > 0 && time.Since(sessionStart) >= minDelay {
+		*reconnectDelay = minDelay
+	}
 	if !sleepContext(ctx, *reconnectDelay) {
 		return false
 	}
@@ -356,14 +438,24 @@ func (a *App) runPingLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			a.sendPing()
+			func() {
+				defer func() {
+					if rec := recover(); rec != nil {
+						if a.publisher != nil {
+							a.publisher.panics.Add(1)
+						}
+						log.Error("rflink ping panic recovered", "panic", rec)
+					}
+				}()
+				a.sendPing()
+			}()
 			timer.Reset(interval)
 		}
 	}
 }
 
 func (a *App) sendPing() {
-	if a.serial == nil || !a.serial.IsConnected() {
+	if a.serial == nil || !a.serial.IsConnected() || !a.serial.WritesAllowed() {
 		return
 	}
 	if a.publisher != nil && a.publisher.PingOutstanding() {
@@ -371,14 +463,34 @@ func (a *App) sendPing() {
 		return
 	}
 	const cmd = "10;PING;"
+	// Mark before the write so a PONG already sitting in the driver buffer
+	// is not applied to a still-zero pingSentAt.
+	if a.publisher != nil {
+		a.publisher.MarkPingSent()
+	}
 	if err := a.serial.Write(cmd); err != nil {
+		if a.publisher != nil {
+			a.publisher.ClearPingSent()
+		}
 		log.Warn("failed to send RFLink PING", "err", err)
 		return
 	}
 	if a.publisher != nil {
-		a.publisher.MarkPingSent()
+		a.publisher.MarkPingWritten()
 	}
 	log.Debug("RFLink PING sent")
+}
+
+// ShutdownGrace is how long main should wait for Stop. Serial reads block until
+// the current read timeout returns, so the deadline has to cover that plus MQTT.
+func (a *App) ShutdownGrace() time.Duration {
+	grace := 25 * time.Second
+	if a != nil && a.opts != nil {
+		if extra := a.opts.serialReadTimeout() + 10*time.Second; extra > grace {
+			grace = extra
+		}
+	}
+	return grace
 }
 
 // Stop gracefully shuts down background workers and closes connections.

@@ -62,21 +62,41 @@ var haEntitySpecs = map[string]haEntitySpec{
 }
 
 type haDiscoveryPayload struct {
-	Name                string         `json:"name"`
-	ObjectID            string         `json:"object_id,omitempty"`
-	UniqueID            string         `json:"unique_id"`
-	StateTopic          string         `json:"state_topic"`
-	DeviceClass         string         `json:"device_class,omitempty"`
-	UnitOfMeasurement   string         `json:"unit_of_measurement,omitempty"`
-	StateClass          string         `json:"state_class,omitempty"`
-	PayloadOn           string         `json:"payload_on,omitempty"`
-	PayloadOff          string         `json:"payload_off,omitempty"`
-	OffDelay            *int           `json:"off_delay,omitempty"`
-	AvailabilityTopic   string         `json:"availability_topic,omitempty"`
-	PayloadAvailable    string         `json:"payload_available,omitempty"`
-	PayloadNotAvailable string         `json:"payload_not_available,omitempty"`
-	JsonAttributesTopic string         `json:"json_attributes_topic,omitempty"`
-	Device              haDeviceConfig `json:"device"`
+	Name                string           `json:"name"`
+	ObjectID            string           `json:"object_id,omitempty"` // kept for HA before 2026.4
+	DefaultEntityID     string           `json:"default_entity_id,omitempty"`
+	UniqueID            string           `json:"unique_id"`
+	Origin              *haOrigin        `json:"origin,omitempty"`
+	StateTopic          string           `json:"state_topic"`
+	DeviceClass         string           `json:"device_class,omitempty"`
+	UnitOfMeasurement   string           `json:"unit_of_measurement,omitempty"`
+	StateClass          string           `json:"state_class,omitempty"`
+	PayloadOn           string           `json:"payload_on,omitempty"`
+	PayloadOff          string           `json:"payload_off,omitempty"`
+	OffDelay            *int             `json:"off_delay,omitempty"`
+	AvailabilityTopic   string           `json:"availability_topic,omitempty"`
+	PayloadAvailable    string           `json:"payload_available,omitempty"`
+	PayloadNotAvailable string           `json:"payload_not_available,omitempty"`
+	Availability        []haAvailability `json:"availability,omitempty"`
+	AvailabilityMode    string           `json:"availability_mode,omitempty"`
+	JsonAttributesTopic string           `json:"json_attributes_topic,omitempty"`
+	Device              haDeviceConfig   `json:"device"`
+}
+
+type haDiscovered struct {
+	component string
+	topic     string
+}
+
+type haAvailability struct {
+	Topic               string `json:"topic"`
+	PayloadAvailable    string `json:"payload_available,omitempty"`
+	PayloadNotAvailable string `json:"payload_not_available,omitempty"`
+}
+
+type haOrigin struct {
+	Name      string `json:"name"`
+	SWVersion string `json:"sw_version,omitempty"`
 }
 
 type haDeviceConfig struct {
@@ -86,7 +106,7 @@ type haDeviceConfig struct {
 	Model        string   `json:"model"`
 }
 
-func (p *Publisher) publishHomeAssistantDiscovery(ctx context.Context, sd *SensorData, fields map[string]string) {
+func (p *Publisher) publishHomeAssistantDiscovery(ctx context.Context, sd *SensorData, fields map[string]string, prefix string) {
 	for field, value := range fields {
 		if value == "" {
 			continue
@@ -95,8 +115,23 @@ func (p *Publisher) publishHomeAssistantDiscovery(ctx context.Context, sd *Senso
 		if (field == "switch" || field == "cmd") && hasSwitchButtonFields(fields) {
 			continue
 		}
-		p.publishHomeAssistantEntity(ctx, sd, field)
+		p.publishHomeAssistantEntity(ctx, sd, field, value, prefix)
 	}
+}
+
+// haDefaultEntityID is the post-2026.4 replacement for JSON object_id.
+// The domain is required; the object id itself stays unchanged so existing
+// entity ids keep matching unique_id.
+func haDefaultEntityID(component, objectID string) string {
+	return component + "." + objectID
+}
+
+func haOriginInfo() *haOrigin {
+	sw := strings.TrimSpace(Version)
+	if sw == "" {
+		sw = "dev"
+	}
+	return &haOrigin{Name: "go-rflink", SWVersion: sw}
 }
 
 func hasSwitchButtonFields(fields map[string]string) bool {
@@ -108,22 +143,32 @@ func hasSwitchButtonFields(fields map[string]string) bool {
 	return false
 }
 
-func resolveHAEntitySpec(field string) haEntitySpec {
+func resolveHAEntitySpec(field, value string) haEntitySpec {
 	if spec, ok := haEntitySpecs[field]; ok {
 		return spec
 	}
 
 	// Per-button channel: sw_04, sw_0a, …
+	// ON/OFF map to a binary sensor. UP/DOWN/ALLON stay a plain sensor so HA
+	// does not drop values that match neither payload_on nor payload_off.
 	if after, ok := strings.CutPrefix(field, "sw_"); ok {
 		ch := after
-		offDelay := 1 // RF remotes often only send ON
+		v := strings.ToUpper(strings.TrimSpace(value))
+		if v == "ON" || v == "OFF" || v == "" {
+			offDelay := 1 // RF remotes often only send ON
+			return haEntitySpec{
+				component:    "binary_sensor",
+				objectSuffix: field,
+				nameSuffix:   fmt.Sprintf("Button %s", strings.ToUpper(ch)),
+				payloadOn:    "ON",
+				payloadOff:   "OFF",
+				offDelay:     &offDelay,
+			}
+		}
 		return haEntitySpec{
-			component:    "binary_sensor",
+			component:    "sensor",
 			objectSuffix: field,
 			nameSuffix:   fmt.Sprintf("Button %s", strings.ToUpper(ch)),
-			payloadOn:    "ON",
-			payloadOff:   "OFF",
-			offDelay:     &offDelay,
 		}
 	}
 
@@ -138,8 +183,8 @@ func resolveHAEntitySpec(field string) haEntitySpec {
 	}
 }
 
-func (p *Publisher) publishHomeAssistantEntity(ctx context.Context, sd *SensorData, field string) {
-	spec := resolveHAEntitySpec(field)
+func (p *Publisher) publishHomeAssistantEntity(ctx context.Context, sd *SensorData, field, value, prefix string) {
+	spec := resolveHAEntitySpec(field, value)
 
 	// Stable unique_id; object_id is short and must NOT repeat the device name
 	// (HA would otherwise produce entity_id like lacrossev4_0002_lacrossev4_0002_temperature).
@@ -147,8 +192,24 @@ func (p *Publisher) publishHomeAssistantEntity(ctx context.Context, sd *SensorDa
 	uniqueID := fmt.Sprintf("gorflink_%s_%s", hwidSafe, sanitizeTopicSegment(spec.objectSuffix))
 	objectID := fmt.Sprintf("%s_%s", hwidSafe, sanitizeTopicSegment(spec.objectSuffix))
 
-	if _, loaded := p.discovered.LoadOrStore(uniqueID, true); loaded {
-		return
+	discoveryTopic := fmt.Sprintf("%s/%s/%s/config",
+		prefix,
+		spec.component,
+		uniqueID,
+	)
+	retiredOld := false
+	if prev, loaded := p.discovered.Load(uniqueID); loaded {
+		old, _ := prev.(haDiscovered)
+		if old.component == spec.component && old.topic == discoveryTopic {
+			return
+		}
+		if old.topic != "" && old.topic != discoveryTopic {
+			if err := p.publishRaw(ctx, old.topic, "", p.opts.mqttQoS(), true); err != nil {
+				log.Error("home assistant discovery retire failed", "topic", old.topic, "err", err)
+				return
+			}
+			retiredOld = true
+		}
 	}
 
 	deviceName := sd.FriendlyName
@@ -159,18 +220,25 @@ func (p *Publisher) publishHomeAssistantEntity(ctx context.Context, sd *SensorDa
 
 	topicID := sd.TopicID()
 	sumTopic := p.sensorFieldTopic(topicID, sumJSONSubtopic)
-	availTopic := p.opts.serialStatusTopic()
+
+	// Both topics must be online. MQTT LWT covers a dead process; serial/status
+	// covers a dead radio while the broker session is still up.
+	avail := []haAvailability{
+		{Topic: p.opts.statusTopic(), PayloadAvailable: statusOnline, PayloadNotAvailable: statusOffline},
+		{Topic: p.opts.serialStatusTopic(), PayloadAvailable: statusOnline, PayloadNotAvailable: statusOffline},
+	}
 
 	// Entity name is ONLY the measurement/button name.
 	// Device block already carries the human device name — avoids HA name doubling.
 	payload := haDiscoveryPayload{
 		Name:                spec.nameSuffix,
 		ObjectID:            objectID,
+		DefaultEntityID:     haDefaultEntityID(spec.component, objectID),
 		UniqueID:            uniqueID,
+		Origin:              haOriginInfo(),
 		StateTopic:          p.sensorFieldTopic(topicID, field),
-		AvailabilityTopic:   availTopic,
-		PayloadAvailable:    statusOnline,
-		PayloadNotAvailable: statusOffline,
+		Availability:        avail,
+		AvailabilityMode:    "all",
 		JsonAttributesTopic: sumTopic,
 		Device: haDeviceConfig{
 			Identifiers:  []string{fmt.Sprintf("gorflink_%s", hwidSafe)},
@@ -214,20 +282,19 @@ func (p *Publisher) publishHomeAssistantEntity(ctx context.Context, sd *SensorDa
 		}
 	}
 
-	discoveryTopic := fmt.Sprintf("%s/%s/%s/config",
-		p.opts.Publish.HADiscoveryPrefix,
-		spec.component,
-		uniqueID,
-	)
-
 	if err := p.publishRaw(ctx, discoveryTopic, payload, p.opts.mqttQoS(), true); err != nil {
-		p.discovered.Delete(uniqueID)
+		if retiredOld {
+			// The previous config is already cleared. Drop the cache entry so
+			// the next frame publishes this topic again.
+			p.discovered.Delete(uniqueID)
+		}
 		log.Error("home assistant discovery publish failed",
 			"topic", discoveryTopic,
 			"err", err,
 		)
 		return
 	}
+	p.discovered.Store(uniqueID, haDiscovered{component: spec.component, topic: discoveryTopic})
 
 	log.Info("home assistant entity discovered",
 		"component", spec.component,

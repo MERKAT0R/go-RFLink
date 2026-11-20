@@ -60,8 +60,27 @@ func ValidateRFLinkCommand(cmd string) error {
 		if len(p) > 96 {
 			return fmt.Errorf("invalid RFLink command: field %d too long", i)
 		}
+		// A second node after a finished command is another phrase on the same line
+		// (10;PING;10;REBOOT;). A unit number such as ;10;ON; stays valid because
+		// the previous field is an address, not a terminal word. 11;20;… resend
+		// stays valid because the previous field is the outer node.
+		if i > 0 && reRFLinkNode.MatchString(p) && commandFieldEndsMessage(parts[i-1]) {
+			return fmt.Errorf("invalid RFLink command: extra command at field %d", i)
+		}
 	}
 	return nil
+}
+
+func commandFieldEndsMessage(field string) bool {
+	if strings.Contains(field, "=") {
+		return true
+	}
+	switch strings.ToUpper(field) {
+	case "PING", "REBOOT", "VERSION", "ON", "OFF", "ALLON", "ALLOFF", "UP", "DOWN", "STOP", "PAIR":
+		return true
+	default:
+		return false
+	}
 }
 
 // ValidateFriendlyNamesCSV validates HWID:Name,HWID2:Name2 lists.

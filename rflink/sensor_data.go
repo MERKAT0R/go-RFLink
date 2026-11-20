@@ -29,6 +29,7 @@ var knownFieldKeys = map[string]struct{}{
 // SensorData represents one message received from RFLink.
 type SensorData struct {
 	Hwid         string            `json:"hwid"`
+	RawHWID      string            `json:"-"` // HWID before the canonical map rewrite
 	Model        string            `json:"model"`
 	Id           string            `json:"id"`
 	FriendlyName string            `json:"name,omitempty"`
@@ -58,7 +59,7 @@ func SensorDataFromMessage(msg string) (*SensorData, error) {
 	nowStr := time.Now().Format(time.RFC3339Nano)
 
 	sd := SensorData{
-		Model:      strings.ReplaceAll(strings.TrimSpace(pieces[2]), " ", "_"),
+		Model:      sanitizeTopicSegment(strings.TrimSpace(pieces[2])),
 		Extra:      make(map[string]string),
 		ReceivedAt: nowStr,
 		Timestamp:  nowStr,
@@ -72,11 +73,16 @@ func SensorDataFromMessage(msg string) (*SensorData, error) {
 
 		arr := strings.SplitN(piece, "=", 2)
 		if len(arr) != 2 {
-			return nil, fmt.Errorf("invalid field %q in message %q", piece, msg)
+			log.Warn("sensor field skipped", "field", piece)
+			continue
 		}
 
 		key := strings.ToUpper(strings.TrimSpace(arr[0]))
 		value := strings.TrimSpace(arr[1])
+		if key == "" {
+			log.Warn("sensor field skipped", "field", piece)
+			continue
+		}
 
 		if _, known := knownFieldKeys[key]; !known {
 			sd.Extra[fieldTopicName(key)] = value
@@ -86,19 +92,29 @@ func SensorDataFromMessage(msg string) (*SensorData, error) {
 		switch key {
 		case "ID":
 			sd.Id = value
-			sd.Hwid = strings.ToUpper(sd.Model + "_" + sd.Id)
+			sd.Hwid = strings.ToUpper(sd.Model + "_" + sanitizeTopicSegment(sd.Id))
+			sd.RawHWID = sd.Hwid
 		case "TEMP":
-			sd.TempRaw = value
 			t, err := strToUint16(value, 16)
 			if err != nil {
-				return nil, fmt.Errorf("temperature could not be parsed: %w", err)
+				log.Warn("temperature field skipped", "value", value, "err", err)
+				break
 			}
-			temp := float32(t) / 10
+			sd.TempRaw = value
+			// RFLink: high bit is the sign, lower 15 bits are |°C|×10.
+			temp := tempCelsiusFromRFLink(t)
 			sd.Temperature = &temp
 		case "HUM":
-			h, err := strToUint16(value, 10)
-			if err != nil {
-				return nil, fmt.Errorf("humidity could not be parsed: %w", err)
+			// Decimal plugins use 0-9; hex plugins (LaCrosse %02x) include a-f.
+			// A bad humidity field must not drop TEMP/ID from the same frame.
+			base := 10
+			if strings.ContainsAny(strings.ToLower(value), "abcdef") {
+				base = 16
+			}
+			h, err := strToUint16(value, base)
+			if err != nil || h > 100 {
+				log.Warn("humidity field skipped", "value", value, "err", err)
+				break
 			}
 			sd.Humidity = &h
 		case "BAT":
@@ -123,6 +139,28 @@ func (sd *SensorData) ApplyCanonicalHWID(o *Options) {
 		return
 	}
 	sd.Hwid = o.CanonicalHWID(sd.Id, sd.Hwid)
+}
+
+func isMomentaryState(v string) bool {
+	switch strings.ToUpper(strings.TrimSpace(v)) {
+	case "ON", "OFF", "ALLON", "ALLOFF", "UP", "DOWN", "STOP":
+		return true
+	default:
+		return false
+	}
+}
+
+// RetainedState is the sensor snapshot safe to store with MQTT retain.
+// One-shot button and alarm words are omitted so a broker restart does not
+// restore CMD=ON.
+func (sd *SensorData) RetainedState() *SensorData {
+	cp := sd.StripEventFields()
+	for k, v := range cp.Extra {
+		if isMomentaryState(v) {
+			delete(cp.Extra, k)
+		}
+	}
+	return cp
 }
 
 // StripEventFields clears cmd/switch so they are not replayed from the pending buffer.
@@ -198,6 +236,15 @@ func (sd *SensorData) TopicID() string {
 
 func fieldTopicName(key string) string {
 	return strings.ToLower(strings.TrimSpace(key))
+}
+
+// tempCelsiusFromRFLink decodes an RFLink TEMP word.
+// The top bit is a sign flag, not two's complement: 0x8066 is −10.2°C, not 3287.0°C.
+func tempCelsiusFromRFLink(raw uint16) float32 {
+	if raw&0x8000 != 0 {
+		return -float32(raw&0x7FFF) / 10
+	}
+	return float32(raw) / 10
 }
 
 // String outputs a string representing the SensorData.

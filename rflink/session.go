@@ -41,14 +41,21 @@ func (s *sessionStore) reaper() {
 	t := time.NewTicker(10 * time.Minute)
 	defer t.Stop()
 	for range t.C {
-		s.mu.Lock()
-		now := time.Now()
-		for id, sess := range s.byID {
-			if now.After(sess.ExpiresAt) {
-				delete(s.byID, id)
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Error("session reaper panic recovered", "panic", rec)
+				}
+			}()
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			now := time.Now()
+			for id, sess := range s.byID {
+				if now.After(sess.ExpiresAt) {
+					delete(s.byID, id)
+				}
 			}
-		}
-		s.mu.Unlock()
+		}()
 	}
 }
 
@@ -168,27 +175,27 @@ func randomSessionID() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-func setSessionCookie(w http.ResponseWriter, r *http.Request, sess *session) {
+func setSessionCookie(w http.ResponseWriter, sess *session, secure bool) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    sess.ID,
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
-		Secure:   r.TLS != nil,
+		Secure:   secure,
 		Expires:  sess.ExpiresAt,
 		MaxAge:   int(time.Until(sess.ExpiresAt).Seconds()),
 	})
 }
 
-func clearSessionCookie(w http.ResponseWriter, r *http.Request) {
+func clearSessionCookie(w http.ResponseWriter, secure bool) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",
 		Path:     "/",
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
-		Secure:   r.TLS != nil,
+		Secure:   secure,
 		MaxAge:   -1,
 		Expires:  time.Unix(0, 0),
 	})

@@ -55,23 +55,79 @@ func (l *loginLimiter) allow(ip string) (ok bool, retryAfter time.Duration) {
 		}
 	}
 	arr = arr[:n]
+	if len(arr) >= loginMaxAttempts {
+		l.locked[ip] = now.Add(loginLockout)
+		l.attempts[ip] = arr
+		l.pruneLocked(now)
+		return false, loginLockout
+	}
+	// Count this attempt before the password check so a parallel burst cannot
+	// all observe a count below the limit.
+	arr = append(arr, now)
 	l.attempts[ip] = arr
 	if len(arr) >= loginMaxAttempts {
 		l.locked[ip] = now.Add(loginLockout)
-		return false, loginLockout
 	}
+	l.pruneLocked(now)
 	return true, 0
 }
 
-func (l *loginLimiter) fail(ip string) {
-	if ip == "" {
-		ip = "unknown"
+func (l *loginLimiter) pruneLocked(now time.Time) {
+	if len(l.locked) < 256 && len(l.attempts) < 256 {
+		return
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.attempts[ip] = append(l.attempts[ip], time.Now())
-	if len(l.attempts[ip]) >= loginMaxAttempts {
-		l.locked[ip] = time.Now().Add(loginLockout)
+	for ip, until := range l.locked {
+		if now.After(until) {
+			delete(l.locked, ip)
+		}
+	}
+	cut := now.Add(-loginWindow)
+	for ip, arr := range l.attempts {
+		n := 0
+		for _, t := range arr {
+			if t.After(cut) {
+				arr[n] = t
+				n++
+			}
+		}
+		if n == 0 {
+			delete(l.attempts, ip)
+			continue
+		}
+		l.attempts[ip] = arr[:n]
+	}
+	for len(l.attempts) > 256 {
+		oldestIP := ""
+		var oldest time.Time
+		for ip, arr := range l.attempts {
+			if len(arr) == 0 {
+				oldestIP = ip
+				break
+			}
+			if oldestIP == "" || arr[0].Before(oldest) {
+				oldestIP = ip
+				oldest = arr[0]
+			}
+		}
+		if oldestIP == "" {
+			break
+		}
+		delete(l.attempts, oldestIP)
+		delete(l.locked, oldestIP)
+	}
+	for len(l.locked) > 256 {
+		oldestIP := ""
+		var oldest time.Time
+		for ip, until := range l.locked {
+			if oldestIP == "" || until.Before(oldest) {
+				oldestIP = ip
+				oldest = until
+			}
+		}
+		if oldestIP == "" {
+			break
+		}
+		delete(l.locked, oldestIP)
 	}
 }
 

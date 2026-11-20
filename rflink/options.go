@@ -163,8 +163,18 @@ func GetOptions() (*Options, error) {
 		return nil, err
 	}
 
+	opts.Publish.Topic = cleanMQTTTopic(opts.Publish.Topic)
+	if opts.Publish.Topic == "" {
+		opts.Publish.Topic = "rflink"
+	}
+	opts.Publish.CmdTopic = cleanMQTTTopic(opts.Publish.CmdTopic)
 	if opts.Publish.CmdTopic == "" {
 		opts.Publish.CmdTopic = opts.Publish.Topic + "/send"
+	}
+	opts.Publish.LWTTopic = cleanMQTTTopic(opts.Publish.LWTTopic)
+	opts.Publish.HADiscoveryPrefix = cleanMQTTTopic(opts.Publish.HADiscoveryPrefix)
+	if opts.Publish.HADiscoveryPrefix == "" {
+		opts.Publish.HADiscoveryPrefix = "homeassistant"
 	}
 
 	if err := validateCmdTopic(opts.Publish.Topic, opts.Publish.CmdTopic); err != nil {
@@ -182,9 +192,15 @@ func GetOptions() (*Options, error) {
 	if opts.Publish.KeepAlive <= 0 {
 		opts.Publish.KeepAlive = 30
 	}
+	if opts.Publish.KeepAlive > 65535 {
+		opts.Publish.KeepAlive = 65535
+	}
 
 	if opts.Publish.SessionExpiry < 0 {
 		opts.Publish.SessionExpiry = 0
+	}
+	if opts.Publish.SessionExpiry > 4294967295 {
+		opts.Publish.SessionExpiry = 4294967295
 	}
 
 	if opts.Serial.Baud <= 0 {
@@ -194,6 +210,9 @@ func GetOptions() (*Options, error) {
 	if opts.Serial.ReadTimeoutSec <= 0 {
 		opts.Serial.ReadTimeoutSec = 10
 	}
+	if opts.Serial.ReadTimeoutSec > 120 {
+		opts.Serial.ReadTimeoutSec = 120
+	}
 
 	if opts.Serial.ReconnectMinDelaySec <= 0 {
 		opts.Serial.ReconnectMinDelaySec = 3
@@ -202,13 +221,29 @@ func GetOptions() (*Options, error) {
 	if opts.Serial.ReconnectMaxDelaySec < opts.Serial.ReconnectMinDelaySec {
 		opts.Serial.ReconnectMaxDelaySec = opts.Serial.ReconnectMinDelaySec
 	}
+	// time.Duration overflows past ~292 years; a day is already a long serial backoff.
+	if opts.Serial.ReconnectMaxDelaySec > 86400 {
+		opts.Serial.ReconnectMaxDelaySec = 86400
+	}
 
 	if opts.Publish.ConnectRetryInterval <= 0 {
 		opts.Publish.ConnectRetryInterval = 5
 	}
+	if opts.Publish.ConnectRetryInterval > 86400 {
+		opts.Publish.ConnectRetryInterval = 86400
+	}
 
 	if opts.Publish.PendingTTLSec < 0 {
 		opts.Publish.PendingTTLSec = 0
+	}
+	if opts.Publish.PendingTTLSec > 86400 {
+		opts.Publish.PendingTTLSec = 86400
+	}
+	if opts.Publish.HealthLogIntervalSec > 86400 {
+		opts.Publish.HealthLogIntervalSec = 86400
+	}
+	if opts.Publish.DedupWindowMs > 86400000 {
+		opts.Publish.DedupWindowMs = 86400000
 	}
 
 	if opts.Publish.CommandRateLimit < 0 {
@@ -222,8 +257,17 @@ func GetOptions() (*Options, error) {
 	if opts.Serial.PingIntervalSec < 0 {
 		opts.Serial.PingIntervalSec = 0
 	}
+	if opts.Serial.PingIntervalSec > 86400 {
+		opts.Serial.PingIntervalSec = 86400
+	}
 	if opts.Serial.PingTimeoutSec < 0 {
 		opts.Serial.PingTimeoutSec = 5
+	}
+	if opts.Serial.PingTimeoutSec > 86400 {
+		opts.Serial.PingTimeoutSec = 86400
+	}
+	if opts.Serial.WatchdogSec > 86400 {
+		opts.Serial.WatchdogSec = 86400
 	}
 	if opts.Serial.PingFailThreshold < 0 {
 		opts.Serial.PingFailThreshold = 3
@@ -266,6 +310,17 @@ func GetOptions() (*Options, error) {
 	return &opts, nil
 }
 
+// cleanMQTTTopic drops surrounding space and slashes so "rflink/" does not
+// become a topic with an empty segment.
+func cleanMQTTTopic(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.Trim(s, "/")
+	for strings.Contains(s, "//") {
+		s = strings.ReplaceAll(s, "//", "/")
+	}
+	return s
+}
+
 // validateCmdTopic ensures the command topic cannot form a feedback loop with sensor topics.
 func validateCmdTopic(topic, cmdTopic string) error {
 	topic = strings.TrimSuffix(topic, "/")
@@ -302,7 +357,7 @@ func parseColonMap(raw string) map[string]string {
 		if len(kv) != 2 {
 			continue
 		}
-		key := strings.TrimSpace(kv[0])
+		key := sanitizeTopicSegment(strings.TrimSpace(kv[0]))
 		val := strings.TrimSpace(kv[1])
 		if key != "" && val != "" {
 			out[strings.ToUpper(key)] = val
@@ -319,9 +374,14 @@ func parseCommandWhitelist(raw string) []string {
 	var out []string
 	for part := range strings.SplitSeq(raw, ",") {
 		part = strings.TrimSpace(part)
-		if part != "" {
-			out = append(out, part)
+		if part == "" {
+			continue
 		}
+		// Prefixes are whole fields. "10" is "10;", and "1" must not allow "10;" or "11;".
+		if !strings.HasSuffix(part, ";") {
+			part += ";"
+		}
+		out = append(out, part)
 	}
 	return out
 }
@@ -350,6 +410,12 @@ func (o *Options) CanonicalHWID(id, defaultHWID string) string {
 	if v, ok := o.hwidMap[strings.ToUpper(id)]; ok {
 		return v
 	}
+	// Map keys are stored in the same sanitized form as MQTT topic segments.
+	if san := strings.ToUpper(sanitizeTopicSegment(strings.TrimSpace(id))); san != "" {
+		if v, ok := o.hwidMap[san]; ok {
+			return v
+		}
+	}
 	return defaultHWID
 }
 
@@ -360,7 +426,7 @@ func (o *Options) CommandAllowed(payload string) bool {
 	}
 	trimmed := strings.TrimSpace(payload)
 	for _, prefix := range o.commandWhitelist {
-		if strings.HasPrefix(trimmed, prefix) {
+		if len(prefix) > 0 && len(trimmed) >= len(prefix) && strings.EqualFold(trimmed[:len(prefix)], prefix) {
 			return true
 		}
 	}
@@ -411,8 +477,8 @@ func (o *Options) SensorIgnored(model, hwid string) bool {
 func parseIgnoreList(raw string) map[string]struct{} {
 	out := make(map[string]struct{})
 	for part := range strings.SplitSeq(raw, ",") {
-		part = strings.ToUpper(strings.TrimSpace(part))
-		if part != "" {
+		part = strings.ToUpper(sanitizeTopicSegment(strings.TrimSpace(part)))
+		if part != "" && part != "_" {
 			out[part] = struct{}{}
 		}
 	}
@@ -490,11 +556,36 @@ func (o *Options) lwtQoS() byte {
 }
 
 func (o *Options) mqttKeepAlive() uint16 {
-	return uint16(o.Publish.KeepAlive)
+	ka := o.Publish.KeepAlive
+	if ka <= 0 {
+		ka = 30
+	}
+	if ka > 65535 {
+		ka = 65535
+	}
+	return uint16(ka)
 }
 
 func (o *Options) mqttSessionExpiry() uint32 {
-	return uint32(o.Publish.SessionExpiry)
+	se := o.Publish.SessionExpiry
+	if se <= 0 {
+		return 0
+	}
+	if se > 4294967295 {
+		se = 4294967295
+	}
+	return uint32(se)
+}
+
+// snapshotHAActuators copies HA discovery settings under runtimeMu.
+func (o *Options) snapshotHAActuators() (enabled bool, prefix string, buttons []haActuatorButton, switches []haActuatorSwitch) {
+	o.runtimeMu.RLock()
+	defer o.runtimeMu.RUnlock()
+	enabled = o.Publish.HomeAssistantDiscovery
+	prefix = o.Publish.HADiscoveryPrefix
+	buttons = append([]haActuatorButton(nil), o.haButtons...)
+	switches = append([]haActuatorSwitch(nil), o.haSwitches...)
+	return
 }
 
 func (o *Options) pendingTTL() time.Duration {

@@ -35,7 +35,7 @@ func main() {
 	select {
 	case <-done:
 		log.Printf("shutdown complete")
-	case <-time.After(15 * time.Second):
+	case <-time.After(app.ShutdownGrace()):
 		log.Printf("shutdown timed out")
 		os.Exit(1)
 	}

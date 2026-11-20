@@ -28,7 +28,7 @@ builds:
     flags:
       - -trimpath
     ldflags:
-      - -s -w -X github.com/MERKAT0R/go-RFLink/rflink.Version={{.Version}} -X github.com/MERKAT0R/go-RFLink/rflink.GitSHA={{.ShortCommit}}
+      - -s -w -X github.com/MERKAT0R/go-rflink/rflink.Version={{.Version}} -X github.com/MERKAT0R/go-rflink/rflink.GitSHA={{.ShortCommit}}
     goos:
       - linux
       - windows

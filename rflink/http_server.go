@@ -16,6 +16,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -344,7 +345,8 @@ func (h *httpAPIServer) issueCSRFForce(w http.ResponseWriter, r *http.Request, f
 	}
 	tok, err := randomHex(32)
 	if err != nil {
-		tok = fmt.Sprintf("%d", time.Now().UnixNano())
+		log.Error("csrf token generation failed", "err", err)
+		return ""
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     cookieCSRF,
@@ -352,7 +354,7 @@ func (h *httpAPIServer) issueCSRFForce(w http.ResponseWriter, r *http.Request, f
 		Path:     "/",
 		HttpOnly: false, // readable by GUI JS (double-submit)
 		SameSite: http.SameSiteStrictMode,
-		Secure:   r.TLS != nil,
+		Secure:   h.cookieSecure(r),
 		MaxAge:   86400,
 	})
 	return tok
@@ -364,6 +366,10 @@ func (h *httpAPIServer) handleCSRF(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tok := h.issueCSRF(w, r)
+	if tok == "" {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "csrf_unavailable"})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"csrf_token": tok})
 }
 
@@ -541,14 +547,22 @@ func (h *httpAPIServer) middlewareSecurityHeaders(next http.Handler) http.Handle
 func (h *httpAPIServer) middlewareCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
-		if origin != "" && h.originAllowed(origin) {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Vary", "Origin")
-			w.Header().Set("Access-Control-Allow-Credentials", "true")
-			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Token, X-CSRF-Token, X-Request-ID")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, OPTIONS")
-			w.Header().Set("Access-Control-Max-Age", "600")
-			w.Header().Set("Access-Control-Expose-Headers", headerRequestID)
+		if origin != "" {
+			allow, credentials := h.originPolicy(origin)
+			if allow && credentials {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+			} else if allow {
+				// "*" is a public API allow-list, not a credentialed reflection of any origin.
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+			}
+			if allow {
+				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Token, X-CSRF-Token, X-Request-ID")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, OPTIONS")
+				w.Header().Set("Access-Control-Max-Age", "600")
+				w.Header().Set("Access-Control-Expose-Headers", headerRequestID)
+			}
 		}
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -558,16 +572,27 @@ func (h *httpAPIServer) middlewareCORS(next http.Handler) http.Handler {
 	})
 }
 
-func (h *httpAPIServer) originAllowed(origin string) bool {
-	if len(h.corsOrigins) == 0 {
-		return false
+// originPolicy reports whether origin is allowed and whether cookies may be sent.
+// An explicit origin match allows credentials. "*" allows the browser to read
+// responses without cookies; it is never reflected back as the caller's origin.
+func (h *httpAPIServer) originPolicy(origin string) (allow bool, credentials bool) {
+	if len(h.corsOrigins) == 0 || origin == "" {
+		return false, false
 	}
+	star := false
 	for _, o := range h.corsOrigins {
-		if o == "*" || strings.EqualFold(o, origin) {
-			return true
+		if o == "*" {
+			star = true
+			continue
+		}
+		if strings.EqualFold(o, origin) {
+			return true, true
 		}
 	}
-	return false
+	if star {
+		return true, false
+	}
+	return false, false
 }
 
 type statusRecorder struct {
@@ -638,20 +663,47 @@ func clientIP(r *http.Request, trusted []*net.IPNet) string {
 	if remote == nil || !ipInNets(remote, trusted) {
 		return host
 	}
-	// Only honour forwarded headers from trusted proxies.
-	if xri := strings.TrimSpace(r.Header.Get(headerRealIP)); xri != "" {
-		if ip := net.ParseIP(xri); ip != nil {
-			return xri
-		}
-	}
+	// Walk X-Forwarded-For from the right and skip trusted proxies.
+	// The leftmost address is client-supplied when the proxy appends.
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		parts := strings.Split(xff, ",")
-		cand := strings.TrimSpace(parts[0])
-		if ip := net.ParseIP(cand); ip != nil {
+		for _, part := range slices.Backward(parts) {
+			cand := strings.TrimSpace(part)
+			ip := net.ParseIP(cand)
+			if ip == nil || ipInNets(ip, trusted) {
+				continue
+			}
 			return cand
 		}
 	}
+	if xri := strings.TrimSpace(r.Header.Get(headerRealIP)); xri != "" {
+		if ip := net.ParseIP(xri); ip != nil && !ipInNets(ip, trusted) {
+			return xri
+		}
+	}
 	return host
+}
+
+func cookieSecure(r *http.Request, trusted []*net.IPNet) bool {
+	if r != nil && r.TLS != nil {
+		return true
+	}
+	if r == nil || len(trusted) == 0 {
+		return false
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ipInNets(ip, trusted) {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+}
+
+func (h *httpAPIServer) cookieSecure(r *http.Request) bool {
+	return cookieSecure(r, h.trustedNets)
 }
 
 func ipInNets(ip net.IP, nets []*net.IPNet) bool {
@@ -794,6 +846,11 @@ func (h *httpAPIServer) handleSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *httpAPIServer) sessionLogin(w http.ResponseWriter, r *http.Request) {
+	// A browser form POST cannot set application/json, so it cannot burn the login limit.
+	if !strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/json") {
+		writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "content_type"})
+		return
+	}
 	// Login may have no session yet: CSRF only if cookie already present.
 	if c, err := r.Cookie(cookieCSRF); err == nil && c != nil && c.Value != "" {
 		header := r.Header.Get(headerCSRF)
@@ -832,7 +889,6 @@ func (h *httpAPIServer) sessionLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !h.app.opts.guiTokenOK(req.Token) {
-		h.loginLimit.fail(ip)
 		log.Info("session login failed", "ip", ip)
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return
@@ -843,7 +899,7 @@ func (h *httpAPIServer) sessionLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "session_create_failed"})
 		return
 	}
-	setSessionCookie(w, r, sess)
+	setSessionCookie(w, sess, h.cookieSecure(r))
 	// Rotate CSRF after successful login
 	csrf := h.issueCSRFForce(w, r, true)
 	log.Info("session created",
@@ -870,7 +926,7 @@ func (h *httpAPIServer) sessionLogout(w http.ResponseWriter, r *http.Request) {
 			log.Info("session revoked", "session_id_prefix", sid[:min(8, len(sid))], "ip", clientIPFrom(r.Context()))
 		}
 	}
-	clearSessionCookie(w, r)
+	clearSessionCookie(w, h.cookieSecure(r))
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
@@ -903,7 +959,6 @@ func (h *httpAPIServer) handleMeta(w http.ResponseWriter, r *http.Request) {
 		"read_only":           h.effectiveReadOnly(),
 		"http_read_only":      h.app.opts.HTTP.ReadOnly,
 		"gui":                 h.app.opts.HTTP.GUI,
-		"runtime_path":        h.app.runtime.pathString(),
 		"version":             Version,
 		"git_sha":             GitSHA,
 		"warning": func() string {
@@ -1090,7 +1145,7 @@ func (h *httpAPIServer) putConfig(w http.ResponseWriter, r *http.Request) {
 		patch.HADiscovery = req.HADiscovery
 	}
 	if req.HADiscoveryPrefix != nil {
-		v := strings.TrimSpace(*req.HADiscoveryPrefix)
+		v := cleanMQTTTopic(*req.HADiscoveryPrefix)
 		if err := ValidateHADiscoveryPrefix(v); err != nil {
 			fieldErrs = append(fieldErrs, err.Error())
 		} else {
@@ -1118,15 +1173,15 @@ func (h *httpAPIServer) putConfig(w http.ResponseWriter, r *http.Request) {
 	if req.HADiscovery != nil {
 		disc = *req.HADiscovery
 	}
-	pfx := h.app.opts.Publish.HADiscoveryPrefix
-	if req.HADiscoveryPrefix != nil {
-		pfx = strings.TrimSpace(*req.HADiscoveryPrefix)
+	pfx := cleanMQTTTopic(h.app.opts.Publish.HADiscoveryPrefix)
+	if patch.HADiscoveryPrefix != nil {
+		pfx = *patch.HADiscoveryPrefix
 	}
-	if disc {
-		if pfx == "" {
-			pfx = "homeassistant"
-			patch.HADiscoveryPrefix = &pfx
-		}
+	// Default the prefix only when this request turned discovery on or set
+	// the prefix. A friendly-name save must not take the key away from env.
+	if disc && pfx == "" && (req.HADiscovery != nil || req.HADiscoveryPrefix != nil) {
+		pfx = "homeassistant"
+		patch.HADiscoveryPrefix = &pfx
 	}
 
 	if len(fieldErrs) > 0 {
@@ -1253,9 +1308,9 @@ func (h *httpAPIServer) handleSessions(w http.ResponseWriter, r *http.Request) {
 				"ip", clientIPFrom(r.Context()),
 			)
 			if id == cur {
-				clearSessionCookie(w, r)
+				clearSessionCookie(w, h.cookieSecure(r))
 			}
-			writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
+			writeJSON(w, http.StatusOK, map[string]any{"status": "revoked", "current": id == cur})
 			return
 		}
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
@@ -1295,11 +1350,8 @@ func (h *httpAPIServer) handleWebhooks(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		file, src := h.app.runtime.snapshot()
-		list := h.app.opts.webhooks
-		if src.Webhooks == "runtime" {
-			list = file.Webhooks
-		}
+		_, src := h.app.runtime.snapshot()
+		list := h.loadWebhookList()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"webhooks": webhooksPublicView(list),
 			"source":   src.Webhooks,
@@ -1321,22 +1373,26 @@ func (h *httpAPIServer) loadWebhookList() []RuntimeWebhook {
 	if src.Webhooks == "runtime" {
 		return append([]RuntimeWebhook{}, file.Webhooks...)
 	}
+	h.app.opts.runtimeMu.RLock()
+	defer h.app.opts.runtimeMu.RUnlock()
 	return append([]RuntimeWebhook{}, h.app.opts.webhooks...)
 }
 
-func (h *httpAPIServer) persistWebhooks(list []RuntimeWebhook) ([]string, error) {
-	if list == nil {
-		list = []RuntimeWebhook{}
+func writeListErr(w http.ResponseWriter, err error) bool {
+	if err == nil {
+		return false
 	}
-	if len(list) > maxWebhooks {
-		return nil, fmt.Errorf("too many webhooks (max %d)", maxWebhooks)
+	switch {
+	case errors.Is(err, errListConflict):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+	case errors.Is(err, errListNotFound):
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+	case errors.Is(err, errListLimit), errors.Is(err, errTokenLimit), errors.Is(err, errWebhookInvalid):
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+	default:
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 	}
-	// SaveOverlay triggers runtime.onChange → webhooks.Reload() (single reload).
-	first, err := h.app.runtime.SaveOverlay(RuntimeFile{Webhooks: list})
-	if err != nil {
-		return nil, err
-	}
-	return first, nil
+	return true
 }
 
 func (h *httpAPIServer) createWebhook(w http.ResponseWriter, r *http.Request) {
@@ -1356,22 +1412,18 @@ func (h *httpAPIServer) createWebhook(w http.ResponseWriter, r *http.Request) {
 	}
 	req.ID = newWebhookID()
 	req.CreatedAt = time.Now().UTC().Format(time.RFC3339)
-	list := h.loadWebhookList()
-	if len(list) >= maxWebhooks {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "max webhooks reached"})
-		return
-	}
-	wantName := strings.ToLower(req.Name)
-	for _, existing := range list {
-		if strings.ToLower(existing.Name) == wantName {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "name already exists"})
-			return
+	first, err := h.app.runtime.UpdateWebhooks(func(cur []RuntimeWebhook) ([]RuntimeWebhook, error) {
+		if len(cur) >= maxWebhooks {
+			return nil, errListLimit
 		}
-	}
-	list = append(list, req)
-	first, err := h.persistWebhooks(list)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		for _, existing := range cur {
+			if strings.EqualFold(existing.Name, req.Name) {
+				return nil, errListConflict
+			}
+		}
+		return append(cur, req), nil
+	})
+	if writeListErr(w, err) {
 		return
 	}
 	log.Info("webhook created", "name", req.Name, "kind", req.Kind, "id_prefix", req.ID[:8])
@@ -1388,46 +1440,46 @@ func (h *httpAPIServer) updateWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
 	var req RuntimeWebhook
 	if err := json.Unmarshal(body, &req); err != nil || strings.TrimSpace(req.ID) == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id required"})
 		return
 	}
-	if err := ValidateWebhookConfig(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-		return
-	}
-	list := h.loadWebhookList()
-	wantName := strings.ToLower(req.Name)
-	for _, existing := range list {
-		if existing.ID != req.ID && strings.ToLower(existing.Name) == wantName {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "name already exists"})
-			return
-		}
-	}
-	found := false
-	for i := range list {
-		if list[i].ID == req.ID {
-			req.CreatedAt = list[i].CreatedAt
-			// Preserve header values if client omitted values (only sent names)
-			if len(req.Headers) == 0 && len(list[i].Headers) > 0 {
-				req.Headers = list[i].Headers
+	var updated RuntimeWebhook
+	_, err := h.app.runtime.UpdateWebhooks(func(cur []RuntimeWebhook) ([]RuntimeWebhook, error) {
+		found := -1
+		for i := range cur {
+			if cur[i].ID == req.ID {
+				found = i
+				break
 			}
-			list[i] = req
-			found = true
-			break
 		}
-	}
-	if !found {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
+		if found < 0 {
+			return nil, errListNotFound
+		}
+		merged, err := mergeWebhookUpdate(cur[found], raw, req)
+		if err != nil {
+			return nil, err
+		}
+		for _, existing := range cur {
+			if existing.ID != merged.ID && strings.EqualFold(existing.Name, merged.Name) {
+				return nil, errListConflict
+			}
+		}
+		cur[found] = merged
+		updated = merged
+		return cur, nil
+	})
+	if writeListErr(w, err) {
 		return
 	}
-	if _, err := h.persistWebhooks(list); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-		return
-	}
-	log.Info("webhook updated", "name", req.Name, "kind", req.Kind)
-	writeJSON(w, http.StatusOK, map[string]any{"webhook": webhooksPublicView([]RuntimeWebhook{req})[0]})
+	log.Info("webhook updated", "name", updated.Name, "kind", updated.Kind)
+	writeJSON(w, http.StatusOK, map[string]any{"webhook": webhooksPublicView([]RuntimeWebhook{updated})[0]})
 }
 
 func (h *httpAPIServer) deleteWebhook(w http.ResponseWriter, r *http.Request) {
@@ -1448,19 +1500,22 @@ func (h *httpAPIServer) deleteWebhook(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id required"})
 		return
 	}
-	list := h.loadWebhookList()
-	filtered := list[:0]
-	for _, hks := range list {
-		if hks.ID != id {
+	_, err := h.app.runtime.UpdateWebhooks(func(cur []RuntimeWebhook) ([]RuntimeWebhook, error) {
+		filtered := make([]RuntimeWebhook, 0, len(cur))
+		found := false
+		for _, hks := range cur {
+			if hks.ID == id {
+				found = true
+				continue
+			}
 			filtered = append(filtered, hks)
 		}
-	}
-	if len(filtered) == len(list) {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
-		return
-	}
-	if _, err := h.persistWebhooks(filtered); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		if !found {
+			return nil, errListNotFound
+		}
+		return filtered, nil
+	})
+	if writeListErr(w, err) {
 		return
 	}
 	log.Info("webhook deleted", "id_prefix", id[:min(8, len(id))])
@@ -1520,11 +1575,16 @@ func (h *httpAPIServer) createAPIToken(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
 	var req struct {
 		Name   string   `json:"name"`
-		Expire string   `json:"expire"` // never | 30m | 24h | RFC3339
+		Expire string   `json:"expire"` // never | 30m | 24h | 30d | RFC3339
 		Scopes []string `json:"scopes"` // default: read, command
 	}
-	if err := json.Unmarshal(body, &req); err != nil || strings.TrimSpace(req.Name) == "" {
+	if err := json.Unmarshal(body, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name required"})
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" || len(name) > maxAPITokenNameLen || strings.ContainsAny(name, "\r\n") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid name"})
 		return
 	}
 	secret, err := generateAPITokenSecret()
@@ -1532,7 +1592,11 @@ func (h *httpAPIServer) createAPIToken(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "token_generate_failed"})
 		return
 	}
-	exp := parseTokenExpiry([]string{"", "", req.Expire}, 2)
+	exp, err := parseTokenExpiry([]string{"", "", req.Expire}, 2)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid expire"})
+		return
+	}
 	var expStr *string
 	if exp != nil {
 		s := exp.Format(time.RFC3339)
@@ -1546,43 +1610,25 @@ func (h *httpAPIServer) createAPIToken(w http.ResponseWriter, r *http.Request) {
 	}
 	suffix := secret[len(secret)-4:]
 	entry := RuntimeAPIToken{
-		Name:        strings.TrimSpace(req.Name),
+		Name:        name,
 		TokenHash:   hashAPIToken(secret, h.app.opts.APITokenPepper),
 		TokenSuffix: suffix, ExpiresAt: expStr,
 		CreatedAt: time.Now().UTC().Format(time.RFC3339),
 		Scopes:    scopes,
 	}
 
-	file, src := h.app.runtime.snapshot()
-	var list []RuntimeAPIToken
-	if src.APITokens == "runtime" {
-		list = append([]RuntimeAPIToken{}, file.APITokens...)
-	} else {
-		// First time: materialize env tokens into runtime, then add new
-		for _, t := range h.app.opts.apiTokens {
-			var es *string
-			if t.ExpiresAt != nil {
-				s := t.ExpiresAt.Format(time.RFC3339)
-				es = &s
+	first, err := h.app.runtime.UpdateAPITokens(func(cur []RuntimeAPIToken) ([]RuntimeAPIToken, error) {
+		if len(cur) >= maxAPITokens {
+			return nil, errTokenLimit
+		}
+		for _, existing := range cur {
+			if strings.EqualFold(existing.Name, entry.Name) {
+				return nil, errListConflict
 			}
-			list = append(list, RuntimeAPIToken{
-				Name: t.Name, TokenHash: t.Hash, TokenSuffix: t.Suffix,
-				ExpiresAt: es, CreatedAt: t.CreatedAt.Format(time.RFC3339),
-				Scopes: t.Scopes,
-			})
 		}
-	}
-	wantName := strings.ToLower(entry.Name)
-	for _, existing := range list {
-		if strings.ToLower(existing.Name) == wantName {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "name already exists"})
-			return
-		}
-	}
-	list = append(list, entry)
-	first, err := h.app.runtime.SaveOverlay(RuntimeFile{APITokens: list})
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return append(cur, entry), nil
+	})
+	if writeListErr(w, err) {
 		return
 	}
 	log.Info("api token created", "name", entry.Name, "first_time_keys", first)
@@ -1616,32 +1662,22 @@ func (h *httpAPIServer) deleteAPIToken(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name required"})
 		return
 	}
-	file, src := h.app.runtime.snapshot()
-	var list []RuntimeAPIToken
-	if src.APITokens == "runtime" {
-		list = file.APITokens
-	} else {
-		for _, t := range h.app.opts.apiTokens {
-			var es *string
-			if t.ExpiresAt != nil {
-				s := t.ExpiresAt.Format(time.RFC3339)
-				es = &s
+	_, err := h.app.runtime.UpdateAPITokens(func(cur []RuntimeAPIToken) ([]RuntimeAPIToken, error) {
+		filtered := make([]RuntimeAPIToken, 0, len(cur))
+		found := false
+		for _, t := range cur {
+			if strings.EqualFold(t.Name, name) {
+				found = true
+				continue
 			}
-			list = append(list, RuntimeAPIToken{
-				Name: t.Name, TokenHash: t.Hash, TokenSuffix: t.Suffix,
-				ExpiresAt: es, CreatedAt: t.CreatedAt.Format(time.RFC3339),
-				Scopes: t.Scopes,
-			})
-		}
-	}
-	filtered := list[:0]
-	for _, t := range list {
-		if !strings.EqualFold(t.Name, name) {
 			filtered = append(filtered, t)
 		}
-	}
-	if _, err := h.app.runtime.SaveOverlay(RuntimeFile{APITokens: filtered}); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		if !found {
+			return nil, errListNotFound
+		}
+		return filtered, nil
+	})
+	if writeListErr(w, err) {
 		return
 	}
 	log.Info("api token deleted", "name", name)
@@ -1657,7 +1693,10 @@ func (h *httpAPIServer) handleGUI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	_ = h.issueCSRF(w, r)
+	if h.issueCSRF(w, r) == "" {
+		http.Error(w, "csrf unavailable", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write([]byte(guiHTML))
@@ -1996,6 +2035,12 @@ let ws = null;
 let wsTimer = null;
 let sessionOK = false;
 let cfgDirty = false;
+let cfgForce = false;
+let cfgEpoch = 0;
+let whEpoch = 0;
+let cmdBusy = false;
+let tokBusy = false;
+let restoreBusy = false;
 window.__rawLines = [];
 window.__cmdHist = [];
 
@@ -2008,9 +2053,16 @@ $('authBtn').onclick = async () => {
   if (sessionOK) {
     try {
       await ensureCSRF();
-      await fetch('/api/v1/session', { method:'DELETE', credentials:'same-origin',
+      const r = await fetch('/api/v1/session', { method:'DELETE', credentials:'same-origin',
         headers: csrfToken ? {'X-CSRF-Token': csrfToken} : {} });
-    } catch(e) {}
+      if (!r.ok) {
+        $('health').innerHTML = '<span class="err">Logout failed: '+r.status+'</span>';
+        return;
+      }
+    } catch(e) {
+      $('health').innerHTML = '<span class="err">Logout failed</span>';
+      return;
+    }
     sessionOK = false;
     authBlocked = true;
     syncAuthUI();
@@ -2048,10 +2100,10 @@ document.addEventListener('change', e => {
   if (e.target && e.target.id === 'haDisc' && e.target.checked) {
     if (!($('haPfx').value||'').trim()) $('haPfx').value = 'homeassistant';
   }
-  if (e.target && ['fn','ig','haDisc','haPfx','haBtn','haSw'].includes(e.target.id)) cfgDirty = true;
+  if (e.target && ['fn','ig','haDisc','haPfx','haBtn','haSw'].includes(e.target.id)) { cfgDirty = true; cfgEpoch++; }
 });
 document.addEventListener('input', e => {
-  if (e.target && ['fn','ig','haPfx','haBtn','haSw'].includes(e.target.id)) cfgDirty = true;
+  if (e.target && ['fn','ig','haPfx','haBtn','haSw'].includes(e.target.id)) { cfgDirty = true; cfgEpoch++; }
 });
 
 $('serial').onclick = async () => {
@@ -2137,10 +2189,10 @@ function applyReadOnlyUI() {
   const ro = !!readOnly;
   $('roBadge').style.display = ro ? '' : 'none';
   if (ro) $('roBadge').textContent = 'read-only';
-  $('send').disabled = ro;
+  $('send').disabled = ro || cmdBusy;
   $('saveCfg').disabled = ro;
   $('cmd').disabled = ro;
-  if ($('tokCreate')) $('tokCreate').disabled = ro;
+  if ($('tokCreate')) $('tokCreate').disabled = ro || tokBusy;
   if ($('rediscover')) $('rediscover').disabled = ro;
   if ($('tokName')) $('tokName').disabled = ro;
   if ($('tokExp')) $('tokExp').disabled = ro;
@@ -2199,7 +2251,7 @@ function confirmDialog(title, msg) {
     const onBack = (e) => { if (e.target === backdrop) cleanup(false); };
     const onKey = (e) => {
       if (e.key === 'Escape') cleanup(false);
-      if (e.key === 'Enter') cleanup(true);
+      if (e.key === 'Enter' && e.target === ok) cleanup(true);
     };
     ok.addEventListener('click', onOk);
     cancel.addEventListener('click', onCancel);
@@ -2295,7 +2347,7 @@ async function tickHealth() {
       ['last_sensor', (h.last_sensor_hwid||'') + ' ' + (h.last_sensor_at||'')],
       ['last_serial', h.last_serial_at||''], ['last_pong', h.last_pong_at||''], ['ping_fails', h.ping_fails],
     ];
-    $('health').innerHTML = rows.map(([k,v]) => '<div class="row"><span>'+k+'</span><span>'+v+'</span></div>').join('');
+    $('health').innerHTML = rows.map(([k,v]) => '<div class="row"><span>'+esc(k)+'</span><span>'+esc(v)+'</span></div>').join('');
   } catch(e) {
     if (e.status === 401) $('health').innerHTML = '<span class="err">'+(e.message||'Unauthorized')+'</span>';
     else $('health').innerHTML = '<span class="err">error: '+(e.message||e)+'</span>';
@@ -2310,7 +2362,7 @@ async function tickSensors() {
     if (!keys.length) $('sensors').textContent = '(none yet)';
     else {
       let html = '<table><tr><th>HWID</th><th>last seen</th></tr>';
-      for (const k of keys) html += '<tr><td class="mono">'+k+'</td><td>'+ls[k]+'</td></tr>';
+      for (const k of keys) html += '<tr><td class="mono">'+esc(k)+'</td><td>'+esc(ls[k])+'</td></tr>';
       $('sensors').innerHTML = html + '</table>';
     }
   } catch(e) {
@@ -2328,23 +2380,28 @@ async function tickRate() {
 }
 async function tickConfig() {
   if (paused || authBlocked || meta.gui_locked) return;
+  const epoch = cfgEpoch;
   try {
     const c = await j('/api/v1/config');
-    if (!cfgDirty) {
-      const active = document.activeElement;
-      if (active !== $('fn')) $('fn').value = c.friendly_names||'';
-      if (active !== $('ig')) $('ig').value = c.ignore_list||'';
-      if (active !== $('haPfx')) $('haPfx').value = c.ha_discovery_prefix||'homeassistant';
-      if (active !== $('haBtn')) $('haBtn').value = c.ha_buttons||'';
-      if (active !== $('haSw')) $('haSw').value = c.ha_switches||'';
-      if (active !== $('haDisc')) $('haDisc').checked = !!c.ha_discovery;
-    }
-    renderBackups(c.backups || []);
-    if (c.source) {
-      $('cfgSource').textContent = 'source: friendly='+(c.source.friendly_names||'?')+
-        ' ignore='+(c.source.ignore_list||'?')+
-        ' ha='+(c.source.ha_discovery||'?')+
-        ' path='+(c.runtime_path||'');
+    const force = cfgForce && epoch === cfgEpoch && !cfgDirty;
+    if (epoch === cfgEpoch) cfgForce = false;
+    if (epoch === cfgEpoch) {
+      if (!cfgDirty) {
+        const active = document.activeElement;
+        if (force || active !== $('fn')) $('fn').value = c.friendly_names||'';
+        if (force || active !== $('ig')) $('ig').value = c.ignore_list||'';
+        if (force || active !== $('haPfx')) $('haPfx').value = c.ha_discovery_prefix||'homeassistant';
+        if (force || active !== $('haBtn')) $('haBtn').value = c.ha_buttons||'';
+        if (force || active !== $('haSw')) $('haSw').value = c.ha_switches||'';
+        if (force || active !== $('haDisc')) $('haDisc').checked = !!c.ha_discovery;
+      }
+      renderBackups(c.backups || []);
+      if (c.source) {
+        $('cfgSource').textContent = 'source: friendly='+(c.source.friendly_names||'?')+
+          ' ignore='+(c.source.ignore_list||'?')+
+          ' ha='+(c.source.ha_discovery||'?')+
+          ' path='+(c.runtime_path||'');
+      }
     }
   } catch(e) {}
   await tickTokens();
@@ -2383,7 +2440,7 @@ async function tickSessions() {
         if (!ok) return;
         try {
           await ensureCSRF();
-          await j('/api/v1/sessions?id='+encodeURIComponent(btn.getAttribute('data-sid')), {method:'DELETE'});
+          await j('/api/v1/sessions', {method:'DELETE', headers:{'Content-Type':'application/json'}, body: JSON.stringify({id: btn.getAttribute('data-sid')})});
           tickSessions();
         } catch(e) {}
       };
@@ -2444,6 +2501,7 @@ async function tickTokens() {
 }
 
 $('tokCreate').onclick = async () => {
+  if (tokBusy) return;
   if (authBlocked || readOnly) {
     $('tokOut').className = 'mono err';
     $('tokOut').textContent = readOnly ? 'read-only' : 'Login required';
@@ -2455,6 +2513,8 @@ $('tokCreate').onclick = async () => {
     $('tokOut').textContent = 'name required';
     return;
   }
+  tokBusy = true;
+  $('tokCreate').disabled = true;
   try {
     await ensureCSRF();
     const res = await j('/api/v1/tokens', {
@@ -2493,6 +2553,9 @@ $('tokCreate').onclick = async () => {
   } catch(e) {
     $('tokOut').className = 'mono err';
     $('tokOut').textContent = (e.body && e.body.error) || e.message || 'error';
+  } finally {
+    tokBusy = false;
+    $('tokCreate').disabled = !!readOnly;
   }
 };
 
@@ -2508,9 +2571,13 @@ function validateRFLinkCmd(cmd) {
   const parts = body.split(';');
   if (parts.length < 2) return 'need node and at least one field (e.g. 10;PING;)';
   if (!/^[0-9]{1,2}$/.test(parts[0])) return 'invalid node (want 10/11/20 etc.)';
+  const terminal = /^(PING|REBOOT|VERSION|ON|OFF|ALLON|ALLOFF|UP|DOWN|STOP|PAIR)$/i;
   for (let i = 0; i < parts.length; i++) {
     if (!parts[i]) return 'empty field at position '+i;
     if (parts[i].length > 96) return 'field too long at position '+i;
+    if (i > 0 && /^[0-9]{1,2}$/.test(parts[i]) && (terminal.test(parts[i-1]) || parts[i-1].indexOf('=') >= 0)) {
+      return 'extra command at field '+i;
+    }
   }
   return '';
 }
@@ -2568,12 +2635,15 @@ function validateHASwitchesCSV(raw) {
 }
 
 async function sendCommand(cmd) {
+  if (cmdBusy) return;
   const verr = validateRFLinkCmd(cmd);
   if (verr) {
     $('cmdOut').className = 'mono err';
     $('cmdOut').textContent = JSON.stringify({status:'rejected', error: verr, command: cmd});
     return;
   }
+  cmdBusy = true;
+  $('send').disabled = true;
   $('cmdOut').textContent = 'sending…';
   try {
     await ensureCSRF();
@@ -2588,6 +2658,9 @@ async function sendCommand(cmd) {
     $('cmdOut').className = 'mono err';
     $('cmdOut').textContent = JSON.stringify(e.body||e.message);
     pushHist(cmd, 'error');
+  } finally {
+    cmdBusy = false;
+    $('send').disabled = !!readOnly;
   }
 }
 $('send').onclick = () => {
@@ -2628,6 +2701,7 @@ $('saveCfg').onclick = async () => {
     $('cfgOut').textContent = errs.join(String.fromCharCode(10));
     return;
   }
+  const epoch = ++cfgEpoch;
   try {
     await ensureCSRF();
     let pfx = ($('haPfx').value||'').trim();
@@ -2641,7 +2715,7 @@ $('saveCfg').onclick = async () => {
         ha_buttons: $('haBtn').value,
         ha_switches: $('haSw').value
       }) });
-    cfgDirty = false;
+    if (epoch === cfgEpoch) cfgDirty = false;
     $('cfgOut').className = 'mono ok';
     let msg = 'saved → runtime file';
     if (res.warning) msg += ' | ' + res.warning;
@@ -2665,16 +2739,27 @@ function renderBackups(list) {
   ).join('');
   el.querySelectorAll('button[data-slot]').forEach(btn => {
     btn.onclick = async () => {
+      if (restoreBusy) return;
       const ok = await confirmDialog('Restore backup #'+btn.dataset.slot+'?', 'Current runtime.json will be backed up first, then replaced.');
       if (!ok) return;
+      restoreBusy = true;
+      const epoch = ++cfgEpoch;
+      const saveBtn = $('saveCfg');
+      if (saveBtn) saveBtn.disabled = true;
+      el.querySelectorAll('button').forEach(b => { b.disabled = true; });
       try {
         await ensureCSRF();
-        const res = await j('/api/v1/config/restore', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({slot:+btn.dataset.slot})});
-        $('fn').value = res.friendly_names||'';
-        $('ig').value = res.ignore_list||'';
+        await j('/api/v1/config/restore', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({slot:+btn.dataset.slot})});
+        if (epoch === cfgEpoch) cfgDirty = false;
+        cfgForce = true;
         $('cfgOut').className='mono ok'; $('cfgOut').textContent = 'restored slot '+btn.dataset.slot;
-        tickConfig();
+        await tickConfig();
       } catch(e) { $('cfgOut').className='mono err'; $('cfgOut').textContent = e.message; }
+      finally {
+        restoreBusy = false;
+        el.querySelectorAll('button').forEach(b => { b.disabled = false; });
+        if (saveBtn) saveBtn.disabled = !!readOnly;
+      }
     };
   });
 }
@@ -2699,7 +2784,7 @@ $('rawDownload').onclick = () => {
   const t = rawTextFull(); if (!t) { flashRawAction('nothing to download', false); return; }
   const stamp = new Date().toISOString().replace(/[:.]/g,'-');
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(new Blob([t+'\\n'], {type:'text/plain;charset=utf-8'}));
+  a.href = URL.createObjectURL(new Blob([t+String.fromCharCode(10)], {type:'text/plain;charset=utf-8'}));
   a.download = 'gorflink-serial-raw-'+stamp+'.txt';
   document.body.appendChild(a); a.click();
   setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
@@ -2743,8 +2828,10 @@ async function bootstrap() {
 
 async function tickWebhooks() {
   if (paused || authBlocked || meta.gui_locked) return;
+  const epoch = whEpoch;
   try {
     const res = await j('/api/v1/webhooks');
+    if (epoch !== whEpoch) return;
     $('whSource').textContent = 'source: '+(res.source||'?')+' · max '+(res.max||8);
     const list = res.webhooks || [];
     if (!list.length) { $('whList').innerHTML = '<span class="hint">(no webhooks)</span>'; return; }
@@ -2775,6 +2862,7 @@ async function tickWebhooks() {
         const id = btn.getAttribute('data-wh-toggle');
         const w = byId[id];
         if (!w) return;
+        whEpoch++;
         try {
           await ensureCSRF();
           const body = {
@@ -2797,6 +2885,7 @@ async function tickWebhooks() {
       btn.onclick = async () => {
         const ok = await confirmDialog('Delete webhook?', 'This stops poll/push for that endpoint.');
         if (!ok) return;
+        whEpoch++;
         try {
           await ensureCSRF();
           await j('/api/v1/webhooks?id='+encodeURIComponent(btn.getAttribute('data-wh')), {method:'DELETE'});
@@ -2818,6 +2907,13 @@ $('whCreate').onclick = async () => {
     $('whOut').className='mono err'; $('whOut').textContent='Login required';
     return;
   }
+  if (!($('whName').value||'').trim() || !($('whURL').value||'').trim()) {
+    $('whOut').className='mono err'; $('whOut').textContent='name and url required';
+    return;
+  }
+  const ok = await confirmDialog('Create webhook?',
+    'Poll hooks execute remote text as RFLink commands (same validation/rate-limit). Push hooks send sensor/raw data to your URL. Ensure the endpoint is trusted.');
+  if (!ok) return;
   const name = ($('whName').value||'').trim();
   const url = ($('whURL').value||'').trim();
   if (!name || !url) {
@@ -2828,9 +2924,6 @@ $('whCreate').onclick = async () => {
     $('whOut').className='mono err'; $('whOut').textContent='url must be http(s)://';
     return;
   }
-  const ok = await confirmDialog('Create webhook «'+name+'»?',
-    'Poll hooks execute remote text as RFLink commands (same validation/rate-limit). Push hooks send sensor/raw data to your URL. Ensure the endpoint is trusted.');
-  if (!ok) return;
   const headers = {};
   const hdr = ($('whHeader').value||'').trim();
   if (hdr) {
@@ -2849,6 +2942,7 @@ $('whCreate').onclick = async () => {
     payload: $('whPayload').value,
     headers: headers,
   };
+  whEpoch++;
   try {
     await ensureCSRF();
     const res = await j('/api/v1/webhooks', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});

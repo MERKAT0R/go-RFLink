@@ -25,8 +25,11 @@ import (
 )
 
 const (
-	statusOnline  = "online"
-	statusOffline = "offline"
+	statusOnline      = "online"
+	statusOffline     = "offline"
+	maxPendingSensors = 256
+	maxSensorSeen     = 512
+	maxDedupEntries   = 500
 )
 
 type pendingSensor struct {
@@ -80,9 +83,11 @@ type Publisher struct {
 	cmdHandler func(string)
 	cmdMu      sync.Mutex
 
-	cancel context.CancelFunc
-	runCtx context.Context
+	cancel     context.CancelFunc
+	mqttCancel context.CancelFunc
+	runCtx     context.Context
 
+	publishMu sync.Mutex
 	pendingMu sync.Mutex
 	pending   map[string]pendingSensor
 
@@ -91,6 +96,11 @@ type Publisher struct {
 
 	sensorSeenMu sync.Mutex
 	sensorSeen   map[string]time.Time // HWID -> last successful publish time
+
+	haMu     sync.Mutex
+	haPrefix string
+	haBtnN   int
+	haSwN    int
 
 	published        atomic.Uint64
 	publishFailed    atomic.Uint64
@@ -110,9 +120,13 @@ type Publisher struct {
 
 	pingMu       sync.Mutex
 	pingSentAt   time.Time // zero = no outstanding ping
+	pingWrite    bool      // Write of 10;PING; has not returned yet
 	lastPongAt   time.Time
 	pingFails    atomic.Uint64 // consecutive missed PONGs
 	rflinkUnresp atomic.Bool
+	// serialRestart asks the serial loop to finish the current Read and reopen.
+	// Buffered so a signal raised between sessions is not lost.
+	serialRestart chan struct{}
 
 	// HTTP debug buffers (ring)
 	rawMu     sync.Mutex
@@ -155,6 +169,10 @@ func NewPublisher(parent context.Context, o *Options) (*Publisher, error) {
 	}
 
 	ctx, cancel := context.WithCancel(parent)
+	// MQTT lifetime is not the app context. App.Stop cancels the parent before
+	// Disconnect; tying the client to it sends a clean DISCONNECT and the broker
+	// then keeps the retained status as "online" (LWT is not published).
+	mqttCtx, mqttCancel := context.WithCancel(context.Background())
 	rawCap := o.HTTP.RawBufferSize
 	if rawCap <= 0 {
 		rawCap = 100
@@ -164,17 +182,19 @@ func NewPublisher(parent context.Context, o *Options) (*Publisher, error) {
 		sampleCap = 50
 	}
 	p := &Publisher{
-		opts:       o,
-		cancel:     cancel,
-		runCtx:     ctx,
-		pending:    make(map[string]pendingSensor),
-		dedupLast:  make(map[string]time.Time),
-		sensorSeen: make(map[string]time.Time),
-		startedAt:  time.Now(),
-		rawLines:   make([]rawLineEntry, 0, rawCap),
-		rawCap:     rawCap,
-		samples:    make([]sensorSample, 0, sampleCap),
-		sampleCap:  sampleCap,
+		opts:          o,
+		cancel:        cancel,
+		mqttCancel:    mqttCancel,
+		runCtx:        ctx,
+		pending:       make(map[string]pendingSensor),
+		dedupLast:     make(map[string]time.Time),
+		sensorSeen:    make(map[string]time.Time),
+		startedAt:     time.Now(),
+		rawLines:      make([]rawLineEntry, 0, rawCap),
+		rawCap:        rawCap,
+		samples:       make([]sensorSample, 0, sampleCap),
+		sampleCap:     sampleCap,
+		serialRestart: make(chan struct{}, 1),
 	}
 	p.lastSensorAt.Store(time.Time{})
 	p.lastSensorHWID.Store("")
@@ -182,6 +202,9 @@ func NewPublisher(parent context.Context, o *Options) (*Publisher, error) {
 
 	log.Info("mqtt client using MQTT v5 only (paho.golang/autopaho)")
 
+	if o.Publish.MqttUsername == "username" && o.Publish.MqttPassword == "password" {
+		log.Warn("MQTT is using the default username and password — set PUBLISH_MQTT_USERNAME and PUBLISH_MQTT_PASSWORD")
+	}
 	if o.Publish.TLSInsecureSkipVerify {
 		log.Warn("TLS InsecureSkipVerify is enabled — connection is vulnerable to MITM attacks")
 	}
@@ -203,6 +226,7 @@ func NewPublisher(parent context.Context, o *Options) (*Publisher, error) {
 	cliCfg := autopaho.ClientConfig{
 		ServerUrls:                    []*url.URL{brokerURL},
 		KeepAlive:                     o.mqttKeepAlive(),
+		AttemptConnection:             mqttAttemptConnection,
 		ReconnectBackoff:              autopaho.NewConstantBackoff(o.mqttConnectRetryInterval()),
 		ConnectTimeout:                30 * time.Second,
 		CleanStartOnInitialConnection: o.Publish.CleanSession,
@@ -232,6 +256,7 @@ func NewPublisher(parent context.Context, o *Options) (*Publisher, error) {
 			if err := p.resubscribeCommands(cm); err != nil {
 				log.Error("mqtt command resubscribe failed", "err", err)
 			}
+			p.resetDiscoveryCache()
 			p.publishHAActuators(ctx)
 			p.flushPending(ctx)
 		},
@@ -253,14 +278,28 @@ func NewPublisher(parent context.Context, o *Options) (*Publisher, error) {
 			}
 		},
 		OnPublishReceived: []func(paho.PublishReceived) (bool, error){
-			func(pr paho.PublishReceived) (bool, error) {
+			func(pr paho.PublishReceived) (handled bool, err error) {
+				defer func() {
+					if rec := recover(); rec != nil {
+						p.panics.Add(1)
+						log.Error("mqtt message handler panic recovered", "panic", rec)
+						handled, err = true, nil
+					}
+				}()
 				if pr.Packet == nil {
+					return true, nil
+				}
+				if pr.Packet.Retain {
+					log.Debug("ignoring retained mqtt message", "topic", pr.Packet.Topic)
 					return true, nil
 				}
 				topic := pr.Packet.Topic
 				payload := string(pr.Packet.Payload)
 				if topic == p.opts.haRediscoverTopic() {
-					p.ClearHADiscovery()
+					haOn, _, _, _ := p.opts.snapshotHAActuators()
+					if haOn {
+						p.ClearHADiscovery()
+					}
 					return true, nil
 				}
 				if topic == p.opts.Publish.CmdTopic {
@@ -280,9 +319,10 @@ func NewPublisher(parent context.Context, o *Options) (*Publisher, error) {
 		log.Info("mqtt connect retry enabled", "interval", o.mqttConnectRetryInterval())
 	}
 
-	cm, err := autopaho.NewConnection(ctx, cliCfg)
+	cm, err := autopaho.NewConnection(mqttCtx, cliCfg)
 	if err != nil {
 		cancel()
+		mqttCancel()
 		return nil, fmt.Errorf("mqtt new connection: %w", err)
 	}
 	p.cm = cm
@@ -292,6 +332,7 @@ func NewPublisher(parent context.Context, o *Options) (*Publisher, error) {
 		defer waitCancel()
 		if err := cm.AwaitConnection(waitCtx); err != nil {
 			cancel()
+			mqttCancel()
 			return nil, fmt.Errorf("mqtt connect: %w", err)
 		}
 	} else {
@@ -381,6 +422,12 @@ func (p *Publisher) applyFriendlyName(sd *SensorData) {
 		sd.FriendlyName = name
 		return
 	}
+	if sd.RawHWID != "" && !strings.EqualFold(sd.RawHWID, sd.TopicID()) {
+		if name := p.opts.FriendlyNameFor(sd.RawHWID); name != "" {
+			sd.FriendlyName = name
+			return
+		}
+	}
 	// Default device label for HA / sumJson when no map entry is configured.
 	sd.FriendlyName = fmt.Sprintf("goRFLink_%s %s", sd.Model, sd.Id)
 }
@@ -416,23 +463,61 @@ func (p *Publisher) isDuplicate(msg string) bool {
 		)
 		return true
 	}
-	p.dedupLast[key] = now
-	if len(p.dedupLast) > 500 {
-		for k, t := range p.dedupLast {
-			if now.Sub(t) > window*2 {
-				delete(p.dedupLast, k)
-			}
-		}
-	}
+	p.evictDedupLocked(now, window)
 	return false
 }
 
+func (p *Publisher) evictDedupLocked(now time.Time, window time.Duration) {
+	if window <= 0 {
+		return
+	}
+	cutoff := now.Add(-2 * window)
+	for key, seen := range p.dedupLast {
+		if seen.Before(cutoff) {
+			delete(p.dedupLast, key)
+		}
+	}
+	for len(p.dedupLast) > maxDedupEntries {
+		oldestKey := ""
+		var oldest time.Time
+		for key, seen := range p.dedupLast {
+			if oldestKey == "" || seen.Before(oldest) {
+				oldestKey = key
+				oldest = seen
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		delete(p.dedupLast, oldestKey)
+	}
+}
+
+// markDedup records a message only after it was published, so a failed attempt
+// can still be retried by the radio's own retransmission.
+func (p *Publisher) markDedup(msg string) {
+	if p.opts.dedupWindow() <= 0 {
+		return
+	}
+	p.dedupMu.Lock()
+	now := time.Now()
+	p.dedupLast[dedupKey(msg)] = now
+	p.evictDedupLocked(now, p.opts.dedupWindow())
+	p.dedupMu.Unlock()
+}
+
 func (p *Publisher) PublishSensor(ctx context.Context, sd *SensorData) error {
+	p.publishMu.Lock()
+	defer p.publishMu.Unlock()
+	return p.publishSensorLocked(ctx, sd)
+}
+
+func (p *Publisher) publishSensorLocked(ctx context.Context, sd *SensorData) error {
 	if p.cm == nil {
 		return fmt.Errorf("mqtt client not connected")
 	}
 	sd.ApplyCanonicalHWID(p.opts)
-	if p.opts.SensorIgnored(sd.Model, sd.Hwid) || p.opts.SensorIgnored(sd.Model, sd.Id) {
+	if p.opts.SensorIgnored(sd.Model, sd.Hwid) || p.opts.SensorIgnored(sd.Model, sd.RawHWID) || p.opts.SensorIgnored(sd.Model, sd.Id) {
 		log.Info("ignored sensor by ignore-list", "model", sd.Model, "hwid", sd.Hwid, "id", sd.Id)
 		return nil
 	}
@@ -440,14 +525,14 @@ func (p *Publisher) PublishSensor(ctx context.Context, sd *SensorData) error {
 	now := time.Now()
 	p.lastSensorAt.Store(now)
 	p.lastSensorHWID.Store(sd.TopicID())
-	p.noteSensorSeen(sd.TopicID(), now)
 
 	fields := sd.FieldsForPublish(p.opts.temperatureUnit())
 	if len(fields) == 0 {
 		log.Info("sensor message has no publishable fields", "id", sd.Id, "hwid", sd.Hwid, "model", sd.Model)
 	}
-	if p.opts.Publish.HomeAssistantDiscovery {
-		p.publishHomeAssistantDiscovery(ctx, sd, fields)
+	haOn, haPrefix, _, _ := p.opts.snapshotHAActuators()
+	if haOn {
+		p.publishHomeAssistantDiscovery(ctx, sd, fields, haPrefix)
 	}
 
 	qos := p.opts.mqttQoS()
@@ -456,7 +541,7 @@ func (p *Publisher) PublishSensor(ctx context.Context, sd *SensorData) error {
 
 	for field, value := range fields {
 		retain := defaultRetain
-		if field == "cmd" || field == "switch" || strings.HasPrefix(field, "sw_") {
+		if field == "cmd" || field == "switch" || strings.HasPrefix(field, "sw_") || isMomentaryState(value) {
 			retain = false
 		}
 		topic := p.sensorFieldTopic(topicID, field)
@@ -468,7 +553,12 @@ func (p *Publisher) PublishSensor(ctx context.Context, sd *SensorData) error {
 	}
 
 	sumTopic := p.sensorFieldTopic(topicID, sumJSONSubtopic)
-	if err := p.publishRaw(ctx, sumTopic, sd, qos, defaultRetain); err != nil {
+	sumPayload := any(sd)
+	if defaultRetain {
+		// A retained aggregate must not pin CMD=ON after a one-shot remote frame.
+		sumPayload = sd.RetainedState()
+	}
+	if err := p.publishRaw(ctx, sumTopic, sumPayload, qos, defaultRetain); err != nil {
 		p.storePending(sd)
 		p.publishFailed.Add(1)
 		return fmt.Errorf("publish sumJson: %w", err)
@@ -476,6 +566,7 @@ func (p *Publisher) PublishSensor(ctx context.Context, sd *SensorData) error {
 
 	p.published.Add(1)
 	p.clearPending(topicID)
+	p.noteSensorSeen(topicID, now)
 	p.appendSensorSample(sd, fields)
 	log.Info("published sensor data", "id", sd.Id, "hwid", sd.Hwid, "fields", len(fields))
 
@@ -544,10 +635,39 @@ func (p *Publisher) storePending(sd *SensorData) {
 		return
 	}
 	key := safe.TopicID()
+	now := time.Now()
 	p.pendingMu.Lock()
-	p.pending[key] = pendingSensor{sd: safe, storedAt: time.Now()}
+	p.pending[key] = pendingSensor{sd: safe, storedAt: now}
+	p.evictPendingLocked(now, ttl, key)
 	p.pendingMu.Unlock()
 	log.Debug("buffered latest sensor value while mqtt down", "hwid", key, "ttl", ttl)
+}
+
+func (p *Publisher) evictPendingLocked(now time.Time, ttl time.Duration, keep string) {
+	for key, item := range p.pending {
+		if now.Sub(item.storedAt) > ttl {
+			delete(p.pending, key)
+			p.pendingDropped.Add(1)
+		}
+	}
+	for len(p.pending) > maxPendingSensors {
+		oldestKey := ""
+		var oldest time.Time
+		for key, item := range p.pending {
+			if key == keep {
+				continue
+			}
+			if oldestKey == "" || item.storedAt.Before(oldest) {
+				oldestKey = key
+				oldest = item.storedAt
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		delete(p.pending, oldestKey)
+		p.pendingDropped.Add(1)
+	}
 }
 
 func (p *Publisher) clearPending(key string) {
@@ -561,6 +681,10 @@ func (p *Publisher) flushPending(ctx context.Context) {
 	if ttl <= 0 {
 		return
 	}
+	// Hold publishMu so a live frame cannot overwrite the snapshot mid-flush.
+	p.publishMu.Lock()
+	defer p.publishMu.Unlock()
+
 	p.pendingMu.Lock()
 	items := make([]pendingSensor, 0, len(p.pending))
 	now := time.Now()
@@ -575,7 +699,7 @@ func (p *Publisher) flushPending(ctx context.Context) {
 	}
 	p.pendingMu.Unlock()
 	for _, item := range items {
-		if err := p.PublishSensor(ctx, item.sd); err != nil {
+		if err := p.publishSensorLocked(ctx, item.sd); err != nil {
 			log.Warn("failed to flush pending sensor", "hwid", item.sd.TopicID(), "err", err)
 			continue
 		}
@@ -599,23 +723,57 @@ func (p *Publisher) SubscribeCommands(handler func(payload string)) error {
 	return nil
 }
 
+// Resubscribe refreshes command and HA rediscover subscriptions from current options.
+func (p *Publisher) Resubscribe() error {
+	if p == nil || p.cm == nil {
+		return nil
+	}
+	return p.resubscribeCommands(p.cm)
+}
+
 func (p *Publisher) resubscribeCommands(cm *autopaho.ConnectionManager) error {
 	p.cmdMu.Lock()
 	handler := p.cmdHandler
 	p.cmdMu.Unlock()
-	if handler == nil && !p.opts.Publish.HomeAssistantDiscovery {
+	haOn, _, _, _ := p.opts.snapshotHAActuators()
+
+	parent := p.runCtx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+
+	var drop []string
+	if handler == nil {
+		drop = append(drop, p.opts.Publish.CmdTopic)
+	}
+	if !haOn {
+		drop = append(drop, p.opts.haRediscoverTopic())
+	}
+	if len(drop) > 0 {
+		if _, err := cm.Unsubscribe(ctx, &paho.Unsubscribe{Topics: drop}); err != nil {
+			log.Debug("mqtt unsubscribe", "topics", drop, "err", err)
+		}
+	}
+	if handler == nil && !haOn {
 		return nil
 	}
 
-	ctx, cancel := context.WithTimeout(p.runCtx, 10*time.Second)
-	defer cancel()
-
 	var subs []paho.SubscribeOptions
 	if handler != nil {
-		subs = append(subs, paho.SubscribeOptions{Topic: p.opts.Publish.CmdTopic, QoS: p.opts.mqttQoS()})
+		subs = append(subs, paho.SubscribeOptions{
+			Topic:          p.opts.Publish.CmdTopic,
+			QoS:            p.opts.mqttQoS(),
+			RetainHandling: 2, // do not replay retained commands on subscribe
+		})
 	}
-	if p.opts.Publish.HomeAssistantDiscovery {
-		subs = append(subs, paho.SubscribeOptions{Topic: p.opts.haRediscoverTopic(), QoS: p.opts.mqttQoS()})
+	if haOn {
+		subs = append(subs, paho.SubscribeOptions{
+			Topic:          p.opts.haRediscoverTopic(),
+			QoS:            p.opts.mqttQoS(),
+			RetainHandling: 2,
+		})
 	}
 	if len(subs) == 0 {
 		return nil
@@ -627,7 +785,7 @@ func (p *Publisher) resubscribeCommands(cm *autopaho.ConnectionManager) error {
 	if handler != nil {
 		log.Info("subscribed to rflink command topic", "topic", p.opts.Publish.CmdTopic)
 	}
-	if p.opts.Publish.HomeAssistantDiscovery {
+	if haOn {
 		log.Info("subscribed to HA rediscover topic", "topic", p.opts.haRediscoverTopic())
 	}
 	return nil
@@ -644,6 +802,7 @@ func (p *Publisher) runPublishLoopInner(ctx context.Context, serialCh <-chan str
 		if recovered := recover(); recovered != nil {
 			p.panics.Add(1)
 			log.Error("publish loop panic recovered", "panic", recovered)
+			sleepContext(ctx, time.Second)
 		}
 	}()
 
@@ -697,16 +856,16 @@ func (p *Publisher) runPublishLoopInner(ctx context.Context, serialCh <-chan str
 
 func (p *Publisher) handleSerialMessage(ctx context.Context, msg string) {
 	p.appendRawLine(msg)
+	// PONG is counted in the serial read callback, before this queue. Counting
+	// it again here can clear a newer PING that was marked while this line waited.
 	if p.isDuplicate(msg) {
 		return
 	}
 	if info, err := ParseGatewayMessage(msg); err == nil && info != nil {
-		if info.Pong {
-			p.NotePong()
-		}
 		if err := p.PublishGatewayInfo(ctx, info); err != nil {
 			log.Warn("failed to publish gateway info", "err", err)
 		} else {
+			p.markDedup(msg)
 			log.Info("gateway info published", "version", info.Version, "pong", info.Pong)
 		}
 		return
@@ -718,7 +877,9 @@ func (p *Publisher) handleSerialMessage(ctx context.Context, msg string) {
 	}
 	if err := p.PublishSensor(ctx, sd); err != nil {
 		log.Warn("failed to publish sensor data", "id", sd.Id, "hwid", sd.Hwid, "err", err)
+		return
 	}
+	p.markDedup(msg)
 }
 
 func (p *Publisher) SetSerialConnected(ctx context.Context, connected bool) {
@@ -841,10 +1002,27 @@ func (p *Publisher) snapshot() HealthSnapshot {
 	}
 }
 
-// MarkPingSent records that 10;PING; was written to serial.
+// MarkPingSent records that 10;PING; is about to be written to serial.
 func (p *Publisher) MarkPingSent() {
 	p.pingMu.Lock()
 	p.pingSentAt = time.Now()
+	p.pingWrite = true
+	p.pingMu.Unlock()
+}
+
+// MarkPingWritten records that the PING write returned successfully.
+// The wait for PONG starts only then, so a slow write is not a missed PONG.
+func (p *Publisher) MarkPingWritten() {
+	p.pingMu.Lock()
+	p.pingWrite = false
+	p.pingMu.Unlock()
+}
+
+// ClearPingSent drops an outstanding ping after a failed write.
+func (p *Publisher) ClearPingSent() {
+	p.pingMu.Lock()
+	p.pingSentAt = time.Time{}
+	p.pingWrite = false
 	p.pingMu.Unlock()
 }
 
@@ -853,9 +1031,11 @@ func (p *Publisher) NotePong() {
 	p.pingMu.Lock()
 	p.lastPongAt = time.Now()
 	p.pingSentAt = time.Time{}
-	p.pingMu.Unlock()
+	p.pingWrite = false
 	p.pingFails.Store(0)
-	if p.rflinkUnresp.Swap(false) {
+	wasUnresp := p.rflinkUnresp.Swap(false)
+	p.pingMu.Unlock()
+	if wasUnresp {
 		log.Info("RFLink responded to PING again")
 	}
 }
@@ -865,33 +1045,67 @@ func (p *Publisher) checkPingTimeout() {
 		return
 	}
 	timeout := p.opts.serialPingTimeout()
+	threshold := p.opts.serialPingFailThreshold()
 	p.pingMu.Lock()
-	sent := p.pingSentAt
-	p.pingMu.Unlock()
-	if sent.IsZero() {
+	// The port write has not finished. A PONG cannot be late yet.
+	if p.pingWrite || p.pingSentAt.IsZero() || time.Since(p.pingSentAt) < timeout {
+		p.pingMu.Unlock()
 		return
 	}
-	if time.Since(sent) < timeout {
-		return
-	}
-	// timed out — clear pending so next interval can send again
-	p.pingMu.Lock()
+	// Timed out. The counter and the unresponsive flag move under the same
+	// lock as NotePong, so a PONG that arrived in between cannot be overwritten.
 	p.pingSentAt = time.Time{}
-	p.pingMu.Unlock()
-
 	fails := p.pingFails.Add(1)
+	mark := int(fails) >= threshold && !p.rflinkUnresp.Swap(true)
+	p.pingMu.Unlock()
 	log.Warn("RFLink PING timeout, no PONG received",
 		"timeout", timeout,
 		"consecutive_fails", fails,
 	)
-	if int(fails) >= p.opts.serialPingFailThreshold() {
-		if !p.rflinkUnresp.Swap(true) {
-			log.Error("RFLink marked unresponsive after consecutive PING failures",
-				"fails", fails,
-				"threshold", p.opts.serialPingFailThreshold(),
-			)
-		}
+	if mark {
+		log.Error("RFLink marked unresponsive after consecutive PING failures",
+			"fails", fails,
+			"threshold", threshold,
+		)
+		// The serial loop publishes serial offline and closes the port only
+		// after Read returns. Doing it here races a newly opened session.
+		p.SignalSerialRestart()
 	}
+}
+
+// SignalSerialRestart asks the open serial session to reopen after the current read.
+func (p *Publisher) SignalSerialRestart() {
+	if p == nil || p.serialRestart == nil {
+		return
+	}
+	select {
+	case p.serialRestart <- struct{}{}:
+	default:
+	}
+}
+
+// DrainSerialRestart drops a restart left over from the previous session.
+func (p *Publisher) DrainSerialRestart() {
+	if p == nil || p.serialRestart == nil {
+		return
+	}
+	select {
+	case <-p.serialRestart:
+	default:
+	}
+}
+
+// ResetPingState forgets the current PING so a reopened port starts a new count.
+func (p *Publisher) ResetPingState() {
+	if p == nil {
+		return
+	}
+	p.pingMu.Lock()
+	p.pingSentAt = time.Time{}
+	p.pingWrite = false
+	p.pingFails.Store(0)
+	p.rflinkUnresp.Store(false)
+	p.pingMu.Unlock()
 }
 
 // PingOutstanding reports whether a PING is waiting for PONG (avoid stacking pings).
@@ -902,30 +1116,89 @@ func (p *Publisher) PingOutstanding() bool {
 }
 
 func (p *Publisher) publishHAActuators(ctx context.Context) {
-	if !p.opts.Publish.HomeAssistantDiscovery {
+	p.haMu.Lock()
+	defer p.haMu.Unlock()
+	enabled, prefix, buttons, switches := p.opts.snapshotHAActuators()
+	nBtn, nSw := 0, 0
+	if enabled {
+		nBtn, nSw = len(buttons), len(switches)
+	}
+	p.retireHAActuatorsLocked(ctx, prefix, nBtn, nSw)
+	if !enabled {
 		return
 	}
-	p.publishHAButtons(ctx)
-	p.publishHASwitches(ctx)
+	p.publishHAButtons(ctx, prefix, buttons)
+	p.publishHASwitches(ctx, prefix, switches)
 }
 
-func (p *Publisher) publishHAButtons(ctx context.Context) {
-	prefix := p.opts.Publish.HADiscoveryPrefix
+// retireHAActuatorsLocked publishes an empty retained config for actuators that
+// left the list or moved to another discovery prefix. Caller holds haMu.
+// Counts advance only after the empty payload is published, so a failed retire
+// is retried and a concurrent publish cannot erase a button that was just created.
+func (p *Publisher) retireHAActuatorsLocked(ctx context.Context, prefix string, nBtn, nSw int) {
+	oldPrefix, oldBtn, oldSw := p.haPrefix, p.haBtnN, p.haSwN
+	if oldPrefix == "" {
+		p.haPrefix, p.haBtnN, p.haSwN = prefix, nBtn, nSw
+		return
+	}
+	qos := p.opts.mqttQoS()
+	btnOK, swOK := true, true
+	for i := range oldBtn {
+		if oldPrefix == prefix && i < nBtn {
+			continue
+		}
+		id := fmt.Sprintf("gorflink_btn_%d", i)
+		topic := fmt.Sprintf("%s/button/%s/config", oldPrefix, id)
+		if err := p.publishRaw(ctx, topic, "", qos, true); err != nil {
+			btnOK = false
+			log.Warn("failed to retire HA button", "topic", topic, "err", err)
+			continue
+		}
+		p.discovered.Delete(id)
+	}
+	for i := range oldSw {
+		if oldPrefix == prefix && i < nSw {
+			continue
+		}
+		id := fmt.Sprintf("gorflink_sw_%d", i)
+		topic := fmt.Sprintf("%s/switch/%s/config", oldPrefix, id)
+		if err := p.publishRaw(ctx, topic, "", qos, true); err != nil {
+			swOK = false
+			log.Warn("failed to retire HA switch", "topic", topic, "err", err)
+			continue
+		}
+		p.discovered.Delete(id)
+	}
+	if btnOK {
+		p.haBtnN = nBtn
+	}
+	if swOK {
+		p.haSwN = nSw
+	}
+	if btnOK && swOK {
+		p.haPrefix = prefix
+	}
+}
+
+func (p *Publisher) publishHAButtons(ctx context.Context, prefix string, buttons []haActuatorButton) {
 	cmdTopic := p.opts.Publish.CmdTopic
-	for i, btn := range p.opts.haButtons {
+	for i, btn := range buttons {
 		objectID := fmt.Sprintf("gorflink_btn_%d", i)
 		uniqueID := objectID
 		if _, loaded := p.discovered.LoadOrStore(uniqueID, true); loaded {
 			continue
 		}
 		payload := map[string]any{
-			"name":                  btn.Name,
-			"unique_id":             uniqueID,
-			"command_topic":         cmdTopic,
-			"payload_press":         btn.Command,
-			"availability_topic":    p.opts.statusTopic(),
-			"payload_available":     statusOnline,
-			"payload_not_available": statusOffline,
+			"name":          btn.Name,
+			"unique_id":     uniqueID,
+			"command_topic": cmdTopic,
+			"payload_press": btn.Command,
+			"origin":        haOriginInfo(),
+			"availability": []map[string]string{
+				{"topic": p.opts.statusTopic(), "payload_available": statusOnline, "payload_not_available": statusOffline},
+				{"topic": p.opts.serialStatusTopic(), "payload_available": statusOnline, "payload_not_available": statusOffline},
+			},
+			"availability_mode": "all",
 			"device": map[string]any{
 				"identifiers":  []string{"gorflink_gateway"},
 				"name":         "RFLink Gateway",
@@ -943,10 +1216,9 @@ func (p *Publisher) publishHAButtons(ctx context.Context) {
 	}
 }
 
-func (p *Publisher) publishHASwitches(ctx context.Context) {
-	prefix := p.opts.Publish.HADiscoveryPrefix
+func (p *Publisher) publishHASwitches(ctx context.Context, prefix string, switches []haActuatorSwitch) {
 	cmdTopic := p.opts.Publish.CmdTopic
-	for i, sw := range p.opts.haSwitches {
+	for i, sw := range switches {
 		objectID := fmt.Sprintf("gorflink_sw_%d", i)
 		uniqueID := objectID
 		if _, loaded := p.discovered.LoadOrStore(uniqueID, true); loaded {
@@ -954,15 +1226,18 @@ func (p *Publisher) publishHASwitches(ctx context.Context) {
 		}
 		// Optimistic switch: no state_topic from RFLink; HA assumes success.
 		payload := map[string]any{
-			"name":                  sw.Name,
-			"unique_id":             uniqueID,
-			"command_topic":         cmdTopic,
-			"payload_on":            sw.CommandOn,
-			"payload_off":           sw.CommandOff,
-			"optimistic":            true,
-			"availability_topic":    p.opts.statusTopic(),
-			"payload_available":     statusOnline,
-			"payload_not_available": statusOffline,
+			"name":          sw.Name,
+			"unique_id":     uniqueID,
+			"command_topic": cmdTopic,
+			"payload_on":    sw.CommandOn,
+			"payload_off":   sw.CommandOff,
+			"optimistic":    true,
+			"origin":        haOriginInfo(),
+			"availability": []map[string]string{
+				{"topic": p.opts.statusTopic(), "payload_available": statusOnline, "payload_not_available": statusOffline},
+				{"topic": p.opts.serialStatusTopic(), "payload_available": statusOnline, "payload_not_available": statusOffline},
+			},
+			"availability_mode": "all",
 			"device": map[string]any{
 				"identifiers":  []string{"gorflink_gateway"},
 				"name":         "RFLink Gateway",
@@ -981,24 +1256,45 @@ func (p *Publisher) publishHASwitches(ctx context.Context) {
 }
 
 func (p *Publisher) noteSensorSeen(hwid string, t time.Time) {
-
 	if hwid == "" {
 		return
 	}
 	p.sensorSeenMu.Lock()
+	defer p.sensorSeenMu.Unlock()
 	p.sensorSeen[hwid] = t
-	p.sensorSeenMu.Unlock()
+	for len(p.sensorSeen) > maxSensorSeen {
+		oldestKey := ""
+		var oldest time.Time
+		for key, seen := range p.sensorSeen {
+			if key == hwid {
+				continue
+			}
+			if oldestKey == "" || seen.Before(oldest) {
+				oldestKey = key
+				oldest = seen
+			}
+		}
+		if oldestKey == "" {
+			break
+		}
+		delete(p.sensorSeen, oldestKey)
+	}
 }
 
-// ClearHADiscovery drops the discovery dedup cache so entities are re-published on next sensor data.
-// Actuator button/switch discovery is republished immediately.
-func (p *Publisher) ClearHADiscovery() {
+func (p *Publisher) resetDiscoveryCache() int {
 	count := 0
 	p.discovered.Range(func(key, _ any) bool {
 		p.discovered.Delete(key)
 		count++
 		return true
 	})
+	return count
+}
+
+// ClearHADiscovery drops the discovery dedup cache so entities are re-published on next sensor data.
+// Actuator button/switch discovery is republished immediately.
+func (p *Publisher) ClearHADiscovery() {
+	count := p.resetDiscoveryCache()
 	log.Info("HA discovery cache cleared; entities will be rediscovered on next sensor messages",
 		"cleared", count,
 	)
@@ -1098,12 +1394,18 @@ func (p *Publisher) RecentSensorSamples() []sensorSample {
 }
 
 func (p *Publisher) Disconnect() {
-
-	if p.cm != nil && p.mqttUp.Load() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		_ = p.publishRaw(ctx, p.opts.statusTopic(), statusOffline, p.opts.mqttQoS(), true)
-		_ = p.publishRaw(ctx, p.opts.serialStatusTopic(), statusOffline, p.opts.mqttQoS(), true)
-		cancel()
+	if p.cm != nil {
+		// Each retained offline gets its own deadline. One slow publish must
+		// not expire the context before serial/status is cleared.
+		for _, topic := range []string{p.opts.statusTopic(), p.opts.serialStatusTopic()} {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_ = p.publishRaw(ctx, topic, statusOffline, p.opts.mqttQoS(), true)
+			cancel()
+		}
+	}
+	// Cancel the client only after the offline retained publishes.
+	if p.mqttCancel != nil {
+		p.mqttCancel()
 	}
 	if p.cancel != nil {
 		p.cancel()

@@ -16,12 +16,12 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Go
-        uses: actions/setup-go@v7
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
-          go-version: "1.27.1"
+          go-version: "1.27.4"
           cache: true
 
       - name: Verify dependencies
@@ -31,26 +31,39 @@ jobs:
         run: go vet ./...
 
       - name: golangci-lint
-        uses: golangci/golangci-lint-action@v9
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
-          version: v2.14.0
+          version: v2.15.0
           args: --timeout=5m
 
       # CI artifact only — real release versions come from goreleaser on tag push (release.yml).
       # github.ref_name is the branch (master/main) or PR ref, never a release tag here.
       - name: Build
+        env:
+          GIT_REF: ${{ github.ref }}
+          GIT_REF_NAME: ${{ github.ref_name }}
+          GIT_SHA: ${{ github.sha }}
         run: |
+          SHORT="${GIT_SHA:0:7}"
           VERSION="dev"
-          case "${{ github.ref }}" in
-            refs/tags/v*) VERSION="${{ github.ref_name }}" ;;
-            refs/heads/*) VERSION="${{ github.ref_name }}-$(git rev-parse --short HEAD)" ;;
-            *) VERSION="ci-$(git rev-parse --short HEAD)" ;;
+          case "$GIT_REF" in
+            refs/tags/v*) VERSION="$GIT_REF_NAME" ;;
+            refs/heads/*) VERSION="$GIT_REF_NAME-$SHORT" ;;
+            *) VERSION="ci-$SHORT" ;;
+          esac
+          case "$VERSION" in
+            *[!A-Za-z0-9._-]*) VERSION="dev" ;;
           esac
           echo "Building with Version=${VERSION}"
-          go build -ldflags "-X github.com/MERKAT0R/go-RFLink/rflink.Version=${VERSION} -X github.com/MERKAT0R/go-RFLink/rflink.GitSHA=$(git rev-parse --short HEAD)" -v -o go-rflink .
+          go build -ldflags "-X github.com/MERKAT0R/go-rflink/rflink.Version=${VERSION} -X github.com/MERKAT0R/go-rflink/rflink.GitSHA=${SHORT}" -v -o go-rflink .
 
       - name: Test
         run: go test ./...
+
+      - name: Fuzz
+        run: |
+          go test ./rflink -run=^$ -fuzz=FuzzSensorMessage -fuzztime=5s
+          go test ./rflink -run=^$ -fuzz=FuzzRFLinkCommand -fuzztime=5s
 
   scorecard:
     name: OpenSSF Scorecard
@@ -63,18 +76,18 @@ jobs:
       actions: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Run Scorecard
-        uses: ossf/scorecard-action@v2.4.4
+        uses: ossf/scorecard-action@23f22cd43608bae7a1f1fa2603d7314dee9538a5 # v2.6.0
         with:
           results_file: results.sarif
           results_format: sarif
           publish_results: true
 
       - name: Upload SARIF to code scanning
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           sarif_file: results.sarif

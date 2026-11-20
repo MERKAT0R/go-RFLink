@@ -9,6 +9,7 @@ import (
 	"crypto/subtle"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -55,12 +56,21 @@ func (h *rawHub) broadcast(entry rawLineEntry) {
 	}
 }
 
+const wsMaxReadBytes = 4096
+
 var wsUpgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
-		// Same-origin GUI; CORS-like check is done via optional Origin allow list in handler.
-		return true
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true // non-browser clients
+		}
+		u, err := url.Parse(origin)
+		if err != nil || u.Host == "" {
+			return false
+		}
+		return strings.EqualFold(u.Host, r.Host)
 	},
 }
 
@@ -77,8 +87,10 @@ func (h *httpAPIServer) handleRawWS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	// Auth: header (non-browser) or ?token= (browser WebSocket cannot set custom headers).
-	if !h.checkAuthWS(w, r) {
+	// Auth: GUI session cookie, or an API token with the read scope.
+	sid, token, ok := h.wsCredentials(r)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 	conn, err := wsUpgrader.Upgrade(w, r, nil)
@@ -89,11 +101,12 @@ func (h *httpAPIServer) handleRawWS(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		_ = conn.Close()
 	}()
+	conn.SetReadLimit(wsMaxReadBytes)
 
 	sub := h.rawHub.subscribe()
 	defer h.rawHub.unsubscribe(sub)
 
-	// Reader: detect client disconnect / pings
+	// Reader: detect client disconnect / pings. Frames are discarded.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -118,6 +131,9 @@ func (h *httpAPIServer) handleRawWS(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-ticker.C:
+			if !h.wsStillAllowed(sid, token) {
+				return
+			}
 			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := conn.WriteMessage(websocket.PingMessage, nil); err != nil {
 				return
@@ -134,15 +150,12 @@ func (h *httpAPIServer) handleRawWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *httpAPIServer) checkAuthWS(w http.ResponseWriter, r *http.Request) bool {
-	opts := h.app.opts
-	// GUI WebSocket: always require a live session (cookie).
-	if sid := sessionIDFromRequest(r); sid != "" {
-		if h.app.sessions.Get(sid) != nil {
-			return true
-		}
+// wsCredentials accepts a live GUI session or a read-scoped API token.
+// Query tokens are not accepted: they land in proxy logs.
+func (h *httpAPIServer) wsCredentials(r *http.Request) (sid, token string, ok bool) {
+	if sid = sessionIDFromRequest(r); sid != "" && h.app.sessions.Get(sid) != nil {
+		return sid, "", true
 	}
-	// Machine clients: API token via header or ?token=
 	got := r.Header.Get("X-API-Token")
 	if got == "" {
 		auth := r.Header.Get("Authorization")
@@ -150,16 +163,23 @@ func (h *httpAPIServer) checkAuthWS(w http.ResponseWriter, r *http.Request) bool
 			got = strings.TrimSpace(auth[7:])
 		}
 	}
-	if got == "" {
-		got = strings.TrimSpace(r.URL.Query().Get("token"))
-	}
 	if got != "" {
-		if _, ok := opts.validAPIToken(got); ok {
-			return true
+		if tok, valid := h.app.opts.validAPIToken(got); valid && tok.hasScope("read") {
+			return "", got, true
 		}
 	}
-	http.Error(w, "unauthorized", http.StatusUnauthorized)
-	return false
+	return "", "", false
+}
+
+func (h *httpAPIServer) wsStillAllowed(sid, token string) bool {
+	if sid != "" {
+		return h.app.sessions.Get(sid) != nil
+	}
+	if token == "" {
+		return false
+	}
+	tok, ok := h.app.opts.validAPIToken(token)
+	return ok && tok.hasScope("read")
 }
 
 func subtleConstantTimeEq(a, b string) bool {
