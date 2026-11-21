@@ -36,3 +36,9 @@ func nextBackoff(current, min, max time.Duration) time.Duration {
 	}
 	return next
 }
+
+// sessionLivedLongEnough reports whether a read stayed open long enough to
+// reset the reconnect delay. Waiting for a stuck write does not count.
+func sessionLivedLongEnough(up, minDelay time.Duration) bool {
+	return minDelay > 0 && up >= minDelay
+}

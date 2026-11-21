@@ -8,6 +8,7 @@ package rflink
 import (
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -40,7 +41,7 @@ func ValidateRFLinkCommand(cmd string) error {
 		return fmt.Errorf("command contains control characters")
 	}
 	for _, r := range cmd {
-		if r > unicode.MaxASCII || r < 0x20 {
+		if r > unicode.MaxASCII || r < 0x20 || r == 0x7F {
 			return fmt.Errorf("command contains non-printable character %q", r)
 		}
 	}
@@ -54,6 +55,7 @@ func ValidateRFLinkCommand(cmd string) error {
 		return fmt.Errorf("invalid RFLink node %q (want 1–2 digits, e.g. 10/11/20)", parts[0])
 	}
 	for i, p := range parts {
+		p = strings.TrimSpace(p)
 		if p == "" {
 			return fmt.Errorf("invalid RFLink command: empty field at position %d", i)
 		}
@@ -63,24 +65,41 @@ func ValidateRFLinkCommand(cmd string) error {
 		// A second node after a finished command is another phrase on the same line
 		// (10;PING;10;REBOOT;). A unit number such as ;10;ON; stays valid because
 		// the previous field is an address, not a terminal word. 11;20;… resend
-		// stays valid because the previous field is the outer node.
-		if i > 0 && reRFLinkNode.MatchString(p) && commandFieldEndsMessage(parts[i-1]) {
+		// stays valid because the previous field is the outer node. A dim level
+		// (10;NewKaku;id;switch;15;) also finishes the phrase.
+		if i > 0 && reRFLinkNode.MatchString(p) && commandFieldEndsMessage(parts[i-1], i-1) {
 			return fmt.Errorf("invalid RFLink command: extra command at field %d", i)
 		}
 	}
 	return nil
 }
 
-func commandFieldEndsMessage(field string) bool {
+func commandFieldEndsMessage(field string, index int) bool {
+	field = strings.TrimSpace(field)
 	if strings.Contains(field, "=") {
 		return true
 	}
 	switch strings.ToUpper(field) {
 	case "PING", "REBOOT", "VERSION", "ON", "OFF", "ALLON", "ALLOFF", "UP", "DOWN", "STOP", "PAIR":
 		return true
-	default:
+	}
+	// The action slot of 10;protocol;id;switch;<level> is a dimmer. A node after
+	// it is a second command, not another address byte.
+	return index >= 4 && isDimLevel(field)
+}
+
+func isDimLevel(field string) bool {
+	if field == "" || len(field) > 2 {
 		return false
 	}
+	n := 0
+	for _, r := range field {
+		if r < '0' || r > '9' {
+			return false
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n <= 15
 }
 
 // ValidateFriendlyNamesCSV validates HWID:Name,HWID2:Name2 lists.
@@ -229,6 +248,68 @@ func ValidateHADiscoveryPrefix(pfx string) error {
 	}
 	if !reHAPrefix.MatchString(pfx) {
 		return fmt.Errorf("ha_discovery_prefix: invalid %q", pfx)
+	}
+	return nil
+}
+
+// ValidateBoundedInt rejects values outside 0..max.
+func ValidateBoundedInt(name string, n, max int) error {
+	if n < 0 || n > max {
+		return fmt.Errorf("%s: must be 0..%d", name, max)
+	}
+	return nil
+}
+
+// ValidateThrottleCSV checks HWID:milliseconds pairs. An empty value is off.
+func ValidateThrottleCSV(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	if strings.ContainsAny(raw, "\r\n") {
+		return fmt.Errorf("throttle: one line")
+	}
+	n := 0
+	for _, part := range splitCSV(raw) {
+		n++
+		if n > 64 {
+			return fmt.Errorf("throttle: too many entries")
+		}
+		hwid, ms, ok := strings.Cut(part, ":")
+		hwid = strings.TrimSpace(hwid)
+		ms = strings.TrimSpace(ms)
+		if !ok || hwid == "" || ms == "" {
+			return fmt.Errorf("throttle: want HWID:milliseconds in %q", part)
+		}
+		if !reHWID.MatchString(strings.ToUpper(hwid)) {
+			return fmt.Errorf("throttle: invalid HWID %q", hwid)
+		}
+		v, err := strconv.Atoi(ms)
+		if err != nil || v <= 0 || v > 86400000 {
+			return fmt.Errorf("throttle: milliseconds for %q must be 1..86400000", hwid)
+		}
+	}
+	return nil
+}
+
+// ValidateCommandDevicesCSV checks a comma-separated gateway list. Empty means every port.
+func ValidateCommandDevicesCSV(raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	if strings.ContainsAny(raw, "\r\n") {
+		return fmt.Errorf("command_devices: one line")
+	}
+	n := 0
+	for _, part := range splitCSV(raw) {
+		n++
+		if n > 16 {
+			return fmt.Errorf("command_devices: too many")
+		}
+		if len(part) > 256 {
+			return fmt.Errorf("command_devices: name too long")
+		}
 	}
 	return nil
 }

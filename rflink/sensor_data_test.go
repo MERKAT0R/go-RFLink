@@ -22,6 +22,33 @@ func TestTempCelsiusSignBit(t *testing.T) {
 	if sd.Temperature == nil || *sd.Temperature != -10.2 {
 		t.Fatalf("parsed temp %#v", sd.Temperature)
 	}
+	if got := tempCelsiusFromRFLink(0xFFF6); got != -1 {
+		t.Fatalf("TEMP=fff6: got %v, want -1", got)
+	}
+	upm, err := SensorDataFromMessage("20;33;UPM/Esic;ID=0001;TEMP=fff6;HUM=33;BAT=OK;")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upm.Temperature == nil || *upm.Temperature != -1 {
+		t.Fatalf("upm temp %#v", upm.Temperature)
+	}
+	if upm.Humidity == nil || *upm.Humidity != 33 {
+		t.Fatalf("upm hum %#v", upm.Humidity)
+	}
+	f2, err := SensorDataFromMessage("20;01;UPM/Esic F2;ID=0001;HUM=32;")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f2.Humidity == nil || *f2.Humidity != 50 {
+		t.Fatalf("f2 hum %#v", f2.Humidity)
+	}
+	lax, err := SensorDataFromMessage("20;01;LaCrosse;ID=0002;HUM=32;")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lax.Humidity == nil || *lax.Humidity != 50 {
+		t.Fatalf("lacrosse hum %#v", lax.Humidity)
+	}
 }
 
 func TestHumidityHexDoesNotDropFrame(t *testing.T) {

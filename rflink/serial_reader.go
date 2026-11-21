@@ -29,14 +29,17 @@ const (
 
 var (
 	errSerialNotConnected = errors.New("serial port not connected")
+	errNoCommandTarget    = errors.New("no serial device matches the command target list")
+	errPartialCommand     = errors.New("command failed on one or more gateways")
 	errSerialStreamClosed = errors.New("serial stream closed")
 	errSerialWriteBusy    = errors.New("serial write still in progress")
 )
 
 // SerialReader manages the serial connection with RFLink and supports reconnect.
 type SerialReader struct {
-	opts *Options
-	mu   sync.Mutex
+	opts   *Options
+	device string
+	mu     sync.Mutex
 	// writeMu serializes port.Write only. disconnect does not take it:
 	// a stalled driver write must not block Stop, and sr.mu must not be
 	// held across the syscall.
@@ -47,16 +50,26 @@ type SerialReader struct {
 	blockWrites atomic.Bool
 }
 
-// NewSerialReader creates a SerialReader and tries to open the port once.
-// A failed initial open is logged; the reconnect loop will keep trying.
+// NewSerialReader creates a SerialReader and tries to open a UART once.
+// A networked gateway is left for the background loop: a dead tcp:// host
+// would otherwise hold startup for the dial timeout.
+// A failed UART open is logged; the reconnect loop will keep trying.
 func NewSerialReader(o *Options) *SerialReader {
-	sr := &SerialReader{opts: o}
+	sr := &SerialReader{opts: o, device: strings.TrimSpace(o.Serial.Device)}
 	if debugEnabled() {
 		listSerialPorts()
 	}
+	if strings.TrimSpace(sr.deviceName()) == "" {
+		log.Info("no primary serial device; other gateways connect on their own")
+		return sr
+	}
+	if isNetworkDevice(sr.deviceName()) {
+		log.Info("network gateway will connect in the background", "device", sr.deviceName())
+		return sr
+	}
 	if err := sr.connect(); err != nil {
 		log.Warn("initial serial open failed, will retry in background",
-			"device", o.Serial.Device,
+			"device", sr.deviceName(),
 			"err", err,
 		)
 	}
@@ -78,6 +91,17 @@ func listSerialPorts() {
 	}
 }
 
+func (sr *SerialReader) deviceName() string {
+	if sr == nil {
+		return ""
+	}
+	name := sr.device
+	if name == "" && sr.opts != nil {
+		name = sr.opts.Serial.Device
+	}
+	return strings.TrimSpace(name)
+}
+
 func (sr *SerialReader) IsConnected() bool {
 	sr.mu.Lock()
 	defer sr.mu.Unlock()
@@ -96,12 +120,18 @@ func (sr *SerialReader) connectLocked() error {
 		sr.port = nil
 	}
 
-	port, err := serial.Open(sr.opts.Serial.Device, &serial.Mode{
-		BaudRate: sr.opts.Serial.Baud,
-		Parity:   serial.NoParity,
-		DataBits: 8,
-		StopBits: serial.OneStopBit,
-	})
+	var port serial.Port
+	var err error
+	if isNetworkDevice(sr.deviceName()) {
+		port, err = dialNetworkDevice(sr.deviceName(), sr.opts.serialReadTimeout())
+	} else {
+		port, err = serial.Open(sr.deviceName(), &serial.Mode{
+			BaudRate: sr.opts.Serial.Baud,
+			Parity:   serial.NoParity,
+			DataBits: 8,
+			StopBits: serial.OneStopBit,
+		})
+	}
 	if err != nil {
 		return err
 	}
@@ -154,18 +184,20 @@ func (sr *SerialReader) WritesAllowed() bool {
 // If the write is still inside the driver when wait elapses, the port stays
 // open: Close during that Write can crash the Windows serial driver.
 func (sr *SerialReader) CloseIfIdle(wait time.Duration) error {
-	if !sr.waitWriteIdle(wait) {
+	if !sr.lockWrite(wait) {
 		return errSerialWriteBusy
 	}
+	// Keep writeMu until Close returns. Releasing it first lets a Write that
+	// already passed WritesAllowed enter the driver during Close.
+	defer sr.writeMu.Unlock()
 	sr.disconnect()
 	return nil
 }
 
-func (sr *SerialReader) waitWriteIdle(wait time.Duration) bool {
+func (sr *SerialReader) lockWrite(wait time.Duration) bool {
 	deadline := time.Now().Add(wait)
 	for {
 		if sr.writeMu.TryLock() {
-			sr.writeMu.Unlock()
 			return true
 		}
 		if wait <= 0 || !time.Now().Before(deadline) {
@@ -176,7 +208,8 @@ func (sr *SerialReader) waitWriteIdle(wait time.Duration) bool {
 }
 
 // Write sends a command to RFLink. Ensures the payload ends with CR+LF.
-// The port pointer is copied under the lock; the syscall runs without it.
+// sr.mu is held only to copy the port pointer. writeMu stays held across the
+// syscall so CloseIfIdle cannot Close in the middle of it.
 // go.bug.st/serial leaves write timeouts at zero, so holding sr.mu across
 // Write would block disconnect, reconnect and Stop for as long as the driver stalls.
 func (sr *SerialReader) Write(command string) error {
@@ -189,15 +222,19 @@ func (sr *SerialReader) Write(command string) error {
 	}
 	payload += "\r\n"
 
+	// writeMu is held across the syscall. CloseIfIdle holds the same lock across
+	// Close. A pause that landed after the check above must not reach the driver.
+	sr.writeMu.Lock()
+	defer sr.writeMu.Unlock()
+	if !sr.WritesAllowed() {
+		return errSerialNotConnected
+	}
 	sr.mu.Lock()
 	port := sr.port
 	sr.mu.Unlock()
 	if port == nil {
 		return errSerialNotConnected
 	}
-
-	sr.writeMu.Lock()
-	defer sr.writeMu.Unlock()
 	buf := []byte(payload)
 	for len(buf) > 0 {
 		n, err := port.Write(buf)
@@ -230,21 +267,38 @@ func (sr *SerialReader) ReadLines(ctx context.Context, handle func(string) error
 
 	buf := make([]byte, 0, 256)
 	tmp := make([]byte, 256)
+	// discarding drops the rest of a line that already exceeded maxSerialLine,
+	// up to and including its newline. Clearing the buffer and parsing the
+	// tail would turn that tail into a new message.
+	discarding := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		n, err := port.Read(tmp)
 		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-			var herr error
-			buf, herr = deliverSerialLines(buf, handle)
-			if herr != nil {
-				return herr
-			}
-			if len(buf) > maxSerialLine {
-				log.Warn("serial line exceeded max length, discarded", "buffered", len(buf))
-				buf = buf[:0]
+			if discarding {
+				if i := bytes.IndexByte(tmp[:n], '\n'); i >= 0 {
+					discarding = false
+					buf = append(buf[:0], tmp[i+1:n]...)
+					var herr error
+					buf, herr = deliverSerialLines(buf, handle)
+					if herr != nil {
+						return herr
+					}
+				}
+			} else {
+				buf = append(buf, tmp[:n]...)
+				var herr error
+				buf, herr = deliverSerialLines(buf, handle)
+				if herr != nil {
+					return herr
+				}
+				if len(buf) > maxSerialLine {
+					log.Warn("serial line exceeded max length, discarded", "buffered", len(buf))
+					buf = buf[:0]
+					discarding = true
+				}
 			}
 		}
 		if err != nil {
@@ -264,6 +318,13 @@ func deliverSerialLines(buf []byte, handle func(string) error) ([]byte, error) {
 		i := bytes.IndexByte(buf, '\n')
 		if i < 0 {
 			return buf, nil
+		}
+		if i > maxSerialLine {
+			log.Warn("serial line exceeded max length, discarded", "len", i)
+			next := make([]byte, len(buf)-i-1)
+			copy(next, buf[i+1:])
+			buf = next
+			continue
 		}
 		line := string(bytes.TrimRight(buf[:i], "\r"))
 		next := make([]byte, len(buf)-i-1)

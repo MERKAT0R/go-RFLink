@@ -49,11 +49,18 @@ type RuntimeFile struct {
 	// "runtime owns this and the list is empty". omitempty cannot tell those apart.
 	APITokens []RuntimeAPIToken `json:"api_tokens"`
 
-	HADiscovery       *bool            `json:"ha_discovery,omitempty"`
-	HADiscoveryPrefix *string          `json:"ha_discovery_prefix,omitempty"`
-	HAButtons         *string          `json:"ha_buttons,omitempty"`
-	HASwitches        *string          `json:"ha_switches,omitempty"`
-	Webhooks          []RuntimeWebhook `json:"webhooks"`
+	HADiscovery       *bool   `json:"ha_discovery,omitempty"`
+	HADiscoveryPrefix *string `json:"ha_discovery_prefix,omitempty"`
+	HAButtons         *string `json:"ha_buttons,omitempty"`
+	HASwitches        *string `json:"ha_switches,omitempty"`
+	// Pointers: a missing key stays with env. A present key, including 0 or "", is owned by the file.
+	MinIntervalMs        *int             `json:"min_interval_ms,omitempty"`
+	Throttle             *string          `json:"throttle,omitempty"`
+	HADeviceTriggers     *bool            `json:"ha_device_triggers,omitempty"`
+	HASensorAvailability *bool            `json:"ha_sensor_availability,omitempty"`
+	HASensorStaleSec     *int             `json:"ha_sensor_stale_sec,omitempty"`
+	CommandDevices       *string          `json:"command_devices,omitempty"`
+	Webhooks             []RuntimeWebhook `json:"webhooks"`
 }
 
 // RuntimeAPIToken stores only a hash of the secret (never plaintext on disk).
@@ -68,15 +75,21 @@ type RuntimeAPIToken struct {
 
 // RuntimeSource describes which layer owns each editable key.
 type RuntimeSource struct {
-	FriendlyNames     string `json:"friendly_names"` // "env" | "runtime"
-	IgnoreList        string `json:"ignore_list"`
-	HWIDMap           string `json:"hwid_map"`
-	APITokens         string `json:"api_tokens"`
-	HADiscovery       string `json:"ha_discovery"`
-	HADiscoveryPrefix string `json:"ha_discovery_prefix"`
-	HAButtons         string `json:"ha_buttons"`
-	HASwitches        string `json:"ha_switches"`
-	Webhooks          string `json:"webhooks"`
+	FriendlyNames        string `json:"friendly_names"` // "env" | "runtime"
+	IgnoreList           string `json:"ignore_list"`
+	HWIDMap              string `json:"hwid_map"`
+	APITokens            string `json:"api_tokens"`
+	HADiscovery          string `json:"ha_discovery"`
+	HADiscoveryPrefix    string `json:"ha_discovery_prefix"`
+	HAButtons            string `json:"ha_buttons"`
+	HASwitches           string `json:"ha_switches"`
+	MinIntervalMs        string `json:"min_interval_ms"`
+	Throttle             string `json:"throttle"`
+	HADeviceTriggers     string `json:"ha_device_triggers"`
+	HASensorAvailability string `json:"ha_sensor_availability"`
+	HASensorStaleSec     string `json:"ha_sensor_stale_sec"`
+	CommandDevices       string `json:"command_devices"`
+	Webhooks             string `json:"webhooks"`
 }
 
 type runtimeManager struct {
@@ -90,6 +103,10 @@ type runtimeManager struct {
 	stopOnce   sync.Once
 	persistGen uint64
 	onChange   func()
+	ownMod     time.Time
+	ownSize    int64
+	ownSet     bool
+	loadedFile bool
 
 	// Env values captured before the first overlay apply. Later applies must be
 	// able to restore them when a key disappears from the file.
@@ -98,15 +115,38 @@ type runtimeManager struct {
 	envHAButtons   string
 	envHASwitches  string
 
+	envMinIntervalMs        int
+	envThrottle             string
+	envHADeviceTriggers     bool
+	envHASensorAvailability bool
+	envHASensorStaleSec     int
+	envCommandDevices       string
+
+	envTokenKey    string
+	envTokens      []apiToken
+	envTokensReady bool
+
 	haSig      string
 	haSigReady bool
 	haChanged  bool
+}
+
+func clampInt(n, lo, hi int) int {
+	if n < lo {
+		return lo
+	}
+	if n > hi {
+		return hi
+	}
+	return n
 }
 
 func defaultRuntimeSources() RuntimeSource {
 	return RuntimeSource{
 		FriendlyNames: "env", IgnoreList: "env", HWIDMap: "env", APITokens: "env",
 		HADiscovery: "env", HADiscoveryPrefix: "env", HAButtons: "env", HASwitches: "env",
+		MinIntervalMs: "env", Throttle: "env", HADeviceTriggers: "env",
+		HASensorAvailability: "env", HASensorStaleSec: "env", CommandDevices: "env",
 		Webhooks: "env",
 	}
 }
@@ -119,15 +159,21 @@ func newRuntimeManager(opts *Options) (*runtimeManager, error) {
 	path = filepath.Clean(path)
 
 	rm := &runtimeManager{
-		path:           path,
-		opts:           opts,
-		sources:        defaultRuntimeSources(),
-		stopWatch:      make(chan struct{}),
-		watchDone:      make(chan struct{}),
-		envHADiscovery: opts.Publish.HomeAssistantDiscovery,
-		envHAPrefix:    opts.Publish.HADiscoveryPrefix,
-		envHAButtons:   opts.Publish.HAButtons,
-		envHASwitches:  opts.Publish.HASwitches,
+		path:                    path,
+		opts:                    opts,
+		sources:                 defaultRuntimeSources(),
+		stopWatch:               make(chan struct{}),
+		watchDone:               make(chan struct{}),
+		envHADiscovery:          opts.Publish.HomeAssistantDiscovery,
+		envHAPrefix:             opts.Publish.HADiscoveryPrefix,
+		envHAButtons:            opts.Publish.HAButtons,
+		envHASwitches:           opts.Publish.HASwitches,
+		envMinIntervalMs:        opts.Publish.MinIntervalMs,
+		envThrottle:             opts.Publish.Throttle,
+		envHADeviceTriggers:     opts.Publish.HADeviceTriggers,
+		envHASensorAvailability: opts.Publish.HASensorAvailability,
+		envHASensorStaleSec:     opts.Publish.HASensorStaleSec,
+		envCommandDevices:       opts.Serial.CommandDevices,
 	}
 
 	if err := rm.ensureDataDir(); err != nil {
@@ -174,6 +220,10 @@ func (rm *runtimeManager) loadAndApply() error {
 			}
 			rm.file = RuntimeFile{Version: runtimeFileVersion}
 			rm.sources = defaultRuntimeSources()
+			rm.loadedFile = false
+			// Env tokens and webhooks are applied here. Skipping this leaves
+			// API_AUTH_TOKEN and WEBHOOKS_JSON unused until a file appears.
+			rm.applyLocked()
 			return nil
 		}
 		return fmt.Errorf("read runtime config: %w", err)
@@ -198,6 +248,7 @@ func (rm *runtimeManager) loadAndApply() error {
 		return nil
 	}
 	rm.file = f
+	rm.loadedFile = true
 	rm.applyLocked()
 	return nil
 }
@@ -215,7 +266,7 @@ func (rm *runtimeManager) applyLocked() {
 	envFriendly := parseColonMap(o.Publish.FriendlyNames)
 	envIgnore := parseIgnoreList(o.Publish.IgnoreList)
 	envHWID := parseColonMap(o.Publish.HWIDMap)
-	envAPI := parseAPIAuthTokens(o.APIAuthTokens, o.APITokenPepper)
+	envAPI := rm.cachedEnvTokensLocked()
 
 	if f.FriendlyNames != nil {
 		o.friendlyNameMap = parseColonMap(*f.FriendlyNames)
@@ -261,9 +312,6 @@ func (rm *runtimeManager) applyLocked() {
 	}
 	if f.HADiscoveryPrefix != nil {
 		pfx := cleanMQTTTopic(*f.HADiscoveryPrefix)
-		if pfx == "" {
-			pfx = "homeassistant"
-		}
 		o.Publish.HADiscoveryPrefix = pfx
 		src.HADiscoveryPrefix = "runtime"
 		log.Info("config override: ha_discovery_prefix from runtime file")
@@ -292,6 +340,50 @@ func (rm *runtimeManager) applyLocked() {
 		o.Publish.HASwitches = rm.envHASwitches
 		o.haSwitches = parseHASwitches(rm.envHASwitches)
 	}
+	if f.MinIntervalMs != nil {
+		o.Publish.MinIntervalMs = clampInt(*f.MinIntervalMs, 0, 86400000)
+		src.MinIntervalMs = "runtime"
+		log.Info("config override: min_interval_ms from runtime file")
+	} else {
+		o.Publish.MinIntervalMs = clampInt(rm.envMinIntervalMs, 0, 86400000)
+	}
+	if f.Throttle != nil {
+		o.Publish.Throttle = *f.Throttle
+		o.throttleBy = parseThrottleMap(*f.Throttle)
+		src.Throttle = "runtime"
+		log.Info("config override: throttle from runtime file")
+	} else {
+		o.Publish.Throttle = rm.envThrottle
+		o.throttleBy = parseThrottleMap(rm.envThrottle)
+	}
+	if f.HADeviceTriggers != nil {
+		o.Publish.HADeviceTriggers = *f.HADeviceTriggers
+		src.HADeviceTriggers = "runtime"
+		log.Info("config override: ha_device_triggers from runtime file")
+	} else {
+		o.Publish.HADeviceTriggers = rm.envHADeviceTriggers
+	}
+	if f.HASensorAvailability != nil {
+		o.Publish.HASensorAvailability = *f.HASensorAvailability
+		src.HASensorAvailability = "runtime"
+		log.Info("config override: ha_sensor_availability from runtime file")
+	} else {
+		o.Publish.HASensorAvailability = rm.envHASensorAvailability
+	}
+	if f.HASensorStaleSec != nil {
+		o.Publish.HASensorStaleSec = clampInt(*f.HASensorStaleSec, 0, 86400)
+		src.HASensorStaleSec = "runtime"
+		log.Info("config override: ha_sensor_stale_sec from runtime file")
+	} else {
+		o.Publish.HASensorStaleSec = clampInt(rm.envHASensorStaleSec, 0, 86400)
+	}
+	if f.CommandDevices != nil {
+		o.Serial.CommandDevices = strings.TrimSpace(*f.CommandDevices)
+		src.CommandDevices = "runtime"
+		log.Info("config override: command_devices from runtime file")
+	} else {
+		o.Serial.CommandDevices = rm.envCommandDevices
+	}
 
 	// Safety: discovery on ⇒ prefix never empty
 	if o.Publish.HomeAssistantDiscovery && strings.TrimSpace(o.Publish.HADiscoveryPrefix) == "" {
@@ -301,19 +393,30 @@ func (rm *runtimeManager) applyLocked() {
 
 	prevHooks := append([]RuntimeWebhook(nil), o.webhooks...)
 	if f.Webhooks != nil {
-		o.webhooks = stabilizeWebhookIDs(sanitizeRuntimeWebhooks(f.Webhooks), prevHooks)
+		next := stabilizeWebhookIDs(sanitizeRuntimeWebhooks(f.Webhooks), prevHooks)
+		o.webhooks = next
 		src.Webhooks = "runtime"
 		log.Info("config override: webhooks from runtime file", "count", len(o.webhooks))
+		if webhookIDsChanged(f.Webhooks, next) {
+			cloned := append([]RuntimeWebhook(nil), next...)
+			rm.file.Webhooks = cloned
+			if err := rm.persistLocked(rm.file); err != nil {
+				log.Warn("webhook ids were not saved", "err", err)
+			}
+		}
 	} else {
 		o.webhooks = stabilizeWebhookIDs(parseWebhooksJSON(o.WebhooksJSON), prevHooks)
 	}
 
 	rm.sources = src
-	sig := fmt.Sprintf("%t\n%s\n%s\n%s",
+	sig := fmt.Sprintf("%t\n%s\n%s\n%s\n%t\n%t\n%d",
 		o.Publish.HomeAssistantDiscovery,
 		o.Publish.HADiscoveryPrefix,
 		o.Publish.HAButtons,
 		o.Publish.HASwitches,
+		o.Publish.HADeviceTriggers,
+		o.Publish.HASensorAvailability,
+		o.Publish.HASensorStaleSec,
 	)
 	if rm.haSigReady && sig != rm.haSig {
 		rm.haChanged = true
@@ -391,7 +494,11 @@ func (rm *runtimeManager) SaveOverlay(patch RuntimeFile) (firstTimeKeys []string
 	if patch.HADiscoveryPrefix != nil {
 		mark("ha_discovery_prefix", f.HADiscoveryPrefix != nil)
 		v := strings.TrimSpace(*patch.HADiscoveryPrefix)
-		if v == "" {
+		discOn := rm.opts.Publish.HomeAssistantDiscovery
+		if patch.HADiscovery != nil {
+			discOn = *patch.HADiscovery
+		}
+		if v == "" && discOn {
 			v = "homeassistant"
 		}
 		f.HADiscoveryPrefix = &v
@@ -405,6 +512,36 @@ func (rm *runtimeManager) SaveOverlay(patch RuntimeFile) (firstTimeKeys []string
 		mark("ha_switches", f.HASwitches != nil)
 		v := *patch.HASwitches
 		f.HASwitches = &v
+	}
+	if patch.MinIntervalMs != nil {
+		mark("min_interval_ms", f.MinIntervalMs != nil)
+		v := *patch.MinIntervalMs
+		f.MinIntervalMs = &v
+	}
+	if patch.Throttle != nil {
+		mark("throttle", f.Throttle != nil)
+		v := *patch.Throttle
+		f.Throttle = &v
+	}
+	if patch.HADeviceTriggers != nil {
+		mark("ha_device_triggers", f.HADeviceTriggers != nil)
+		v := *patch.HADeviceTriggers
+		f.HADeviceTriggers = &v
+	}
+	if patch.HASensorAvailability != nil {
+		mark("ha_sensor_availability", f.HASensorAvailability != nil)
+		v := *patch.HASensorAvailability
+		f.HASensorAvailability = &v
+	}
+	if patch.HASensorStaleSec != nil {
+		mark("ha_sensor_stale_sec", f.HASensorStaleSec != nil)
+		v := *patch.HASensorStaleSec
+		f.HASensorStaleSec = &v
+	}
+	if patch.CommandDevices != nil {
+		mark("command_devices", f.CommandDevices != nil)
+		v := strings.TrimSpace(*patch.CommandDevices)
+		f.CommandDevices = &v
 	}
 	if patch.Webhooks != nil {
 		mark("webhooks", f.Webhooks != nil)
@@ -567,6 +704,11 @@ func (rm *runtimeManager) persistLocked(f RuntimeFile) error {
 	}
 	rm.persistGen++
 	_ = os.Chmod(rm.path, 0o600)
+	if st, statErr := os.Stat(rm.path); statErr == nil {
+		rm.ownMod = st.ModTime()
+		rm.ownSize = st.Size()
+		rm.ownSet = true
+	}
 	if hadCurrent {
 		if err := rm.shiftBackupsLocked(snap); err != nil {
 			log.Warn("runtime config backup rotate failed", "err", err)
@@ -574,6 +716,22 @@ func (rm *runtimeManager) persistLocked(f RuntimeFile) error {
 	}
 	log.Info("runtime config saved", "path", rm.path)
 	return nil
+}
+
+// adoptOwnWrite reports that this stat is the file we just saved.
+// The watcher then skips a second apply, so webhooks are not restarted
+// a few seconds after our own write. A later edit with a different stat reloads.
+func (rm *runtimeManager) adoptOwnWrite(st os.FileInfo) bool {
+	if rm == nil || st == nil {
+		return false
+	}
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	if !rm.ownSet || !st.ModTime().Equal(rm.ownMod) || st.Size() != rm.ownSize {
+		return false
+	}
+	rm.ownSet = false
+	return true
 }
 
 // shiftBackupsLocked moves an already-taken snapshot of the previous file into bak.1.
@@ -668,9 +826,25 @@ func (rm *runtimeManager) watchLoop() {
 	var seenMod time.Time
 	var seenSize int64
 	var seen bool
+	var hadFile bool
+	rm.mu.Lock()
+	loaded := rm.loadedFile
+	rm.mu.Unlock()
 	if st, err := os.Stat(rm.path); err == nil {
 		lastMod = st.ModTime()
 		lastSize = st.Size()
+		hadFile = true
+	} else if os.IsNotExist(err) && loaded {
+		// The file can disappear before this goroutine takes its first look.
+		// Memory would otherwise keep the overlay until the process restarts.
+		if err := rm.loadAndApply(); err != nil {
+			log.Warn("runtime config removed but env reload failed", "err", err)
+		} else {
+			log.Info("runtime config removed, using env only", "path", rm.path)
+			if rm.onChange != nil {
+				rm.onChange()
+			}
+		}
 	}
 	for {
 		select {
@@ -685,6 +859,27 @@ func (rm *runtimeManager) watchLoop() {
 				}()
 				st, err := os.Stat(rm.path)
 				if err != nil {
+					if os.IsNotExist(err) && hadFile {
+						hadFile = false
+						lastMod = time.Time{}
+						lastSize = 0
+						seen = false
+						if err := rm.loadAndApply(); err != nil {
+							log.Warn("runtime config removed but env reload failed", "err", err)
+							return
+						}
+						log.Info("runtime config removed, using env only", "path", rm.path)
+						if rm.onChange != nil {
+							rm.onChange()
+						}
+					}
+					return
+				}
+				hadFile = true
+				if rm.adoptOwnWrite(st) {
+					lastMod = st.ModTime()
+					lastSize = st.Size()
+					seen = false
 					return
 				}
 				if st.ModTime().Equal(lastMod) && st.Size() == lastSize {
@@ -837,25 +1032,26 @@ func parseAPIAuthTokens(raw, pepper string) []apiToken {
 		if part == "" {
 			continue
 		}
-		// name:TOKEN[:expire[:scopes]] — scopes e.g. read+command or read,command,admin
-		bits := strings.SplitN(part, ":", 4)
-		if len(bits) < 2 {
-			log.Warn("API_AUTH_TOKEN: skip invalid entry (want name:TOKEN[:expire[:scopes]])", "entry", part)
+		// name:TOKEN[:expire[:scopes]] — expire may be RFC3339, which contains ':'.
+		name, tok, expire, scopeText, ok := splitAPIAuthEntry(part)
+		if !ok {
+			name, _, found := strings.Cut(part, ":")
+			name = strings.TrimSpace(name)
+			if found && name != "" {
+				log.Warn("API_AUTH_TOKEN: skip invalid entry (want name:TOKEN[:expire[:scopes]])", "name", name)
+			} else {
+				log.Warn("API_AUTH_TOKEN: skip invalid entry (want name:TOKEN[:expire[:scopes]])")
+			}
 			continue
 		}
-		name := strings.TrimSpace(bits[0])
-		tok := strings.TrimSpace(bits[1])
-		if name == "" || tok == "" {
-			continue
-		}
-		exp, err := parseTokenExpiry(bits, 2)
+		exp, err := parseTokenExpiry([]string{"", "", expire}, 2)
 		if err != nil {
 			log.Warn("API_AUTH_TOKEN: skip entry with invalid expire", "name", name, "err", err)
 			continue
 		}
 		scopes := defaultAPITokenScopes
-		if len(bits) >= 4 {
-			scopes = parseScopeList(bits[3])
+		if scopeText != "" {
+			scopes = parseScopeList(scopeText)
 		}
 		suffix := tok
 		if len(suffix) > 4 {
@@ -867,6 +1063,63 @@ func parseAPIAuthTokens(raw, pepper string) []apiToken {
 		})
 	}
 	return out
+}
+
+func (rm *runtimeManager) cachedEnvTokensLocked() []apiToken {
+	key := rm.opts.APIAuthTokens + "\x00" + rm.opts.APITokenPepper
+	if rm.envTokensReady && rm.envTokenKey == key {
+		return rm.envTokens
+	}
+	rm.envTokens = parseAPIAuthTokens(rm.opts.APIAuthTokens, rm.opts.APITokenPepper)
+	rm.envTokenKey = key
+	rm.envTokensReady = true
+	return rm.envTokens
+}
+
+// splitAPIAuthEntry splits name:TOKEN[:expire[:scopes]]. An RFC3339 expire
+// contains colons, so the scope list is taken only when the final field is
+// read, command, or admin.
+func splitAPIAuthEntry(part string) (name, token, expire, scopes string, ok bool) {
+	name, rest, found := strings.Cut(part, ":")
+	if !found {
+		return "", "", "", "", false
+	}
+	token, rest, found = strings.Cut(rest, ":")
+	name = strings.TrimSpace(name)
+	token = strings.TrimSpace(token)
+	if name == "" || token == "" {
+		return "", "", "", "", false
+	}
+	if !found {
+		return name, token, "", "", true
+	}
+	expire = strings.TrimSpace(rest)
+	if i := strings.LastIndex(expire, ":"); i >= 0 {
+		tail := strings.TrimSpace(expire[i+1:])
+		if scopeListOK(tail) {
+			scopes = tail
+			expire = strings.TrimSpace(expire[:i])
+		}
+	}
+	return name, token, expire, scopes, true
+}
+
+func scopeListOK(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	raw = strings.ReplaceAll(raw, "+", ",")
+	ok := false
+	for part := range strings.SplitSeq(raw, ",") {
+		switch strings.ToLower(strings.TrimSpace(part)) {
+		case "read", "command", "admin":
+			ok = true
+		default:
+			return false
+		}
+	}
+	return ok
 }
 
 func parseScopeList(raw string) []string {

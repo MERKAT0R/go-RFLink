@@ -6,10 +6,10 @@ WORKDIR /build
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify
 COPY . .
-ARG VERSION=dev
+ARG VERSION=0.4.0
 ARG GIT_SHA=unknown
 RUN go build -trimpath \
-    -ldflags="-s -w -X github.com/MERKAT0R/go-RFLink/rflink.Version=${VERSION} -X github.com/MERKAT0R/go-RFLink/rflink.GitSHA=${GIT_SHA}" \
+    -ldflags="-s -w -X github.com/MERKAT0R/go-rflink/rflink.Version=${VERSION} -X github.com/MERKAT0R/go-rflink/rflink.GitSHA=${GIT_SHA}" \
     -o /app/go-rflink .
 
 FROM alpine:3.24@sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf

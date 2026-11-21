@@ -7,8 +7,8 @@ package rflink
 
 // Set at build time:
 //
-//	go build -ldflags "-X rflink.Version=1.2.3 -X rflink.GitSHA=$(git rev-parse --short HEAD)"
+//	go build -ldflags "-X rflink.Version=0.4.0 -X rflink.GitSHA=$(git rev-parse --short HEAD)"
 var (
-	Version = "dev"
+	Version = "0.4.0"
 	GitSHA  = "unknown"
 )

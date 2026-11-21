@@ -8,7 +8,7 @@
 #   goreleaser release --snapshot --clean
 #
 # Release:
-#   git tag v1.2.3 && git push origin v1.2.3
+#   git tag v0.4.0 && git push origin v0.4.0
 
 version: 2
 
@@ -85,27 +85,53 @@ release:
   name_template: "v{{ .Version }}"
   draft: false
   prerelease: auto
-  footer: >-
-    
+  # Literal block: a folded scalar (>-) turns each single newline into a space,
+  # so GitHub receives headings and fences on the same line and the notes fall apart.
+  footer: |-
+    ## What's new since v0.2.1
+
+    - Several RFLink gateways can run together, including a board on the network (`tcp://host:port`). Each gateway then has its own status, and Home Assistant follows the one that received the sensor.
+    - A command sent to several gateways is `partial` when only some of them accept it.
+    - `/metrics` serves Prometheus counters, and a `.env` file is picked up when it is present.
+    - Home Assistant can publish a momentary button as a device trigger, show the switch state echoed by RFLink, and mark a single sensor offline after it goes quiet.
+    - MQTT can use a client certificate. Commands are logged with who sent them and how they finished.
+    - A Home Assistant add-on and an Unraid template are included. In Docker, set `TZ` (the image default is `Etc/UTC`).
+
+    ## Fixes
+
+    - After a crash, retained serial and health messages expire instead of staying `online`. A clean stop publishes `offline`.
+    - Removing a gateway from the configuration clears its old `gateway/info`.
+    - The firmware answer to `10;version;` stays in place when a later PONG arrives.
+    - Deleting `runtime.json` returns settings to the environment variables.
+    - A webhook does not carry your headers to another host after a redirect, and it refuses cloud-metadata addresses.
+    - Signing out cannot end a different session.
+
     ---
-    
+
     ## Run
-    
-    Do not forget to set the _required_ environment variables (see `env.sh.example` & carefully `README.md`).
-    
-    # Docker
+
+    Do not forget to set the _required_ environment variables (see `env.sh.example` and carefully `README.md`).
+
+    ### Docker
+
     ```bash
     docker pull ghcr.io/merkat0r/go-rflink:latest
     ```
-    # Linux x64 
+
+    ### Linux x64
+
     ```bash
-    tar -xzf go-rflink_0.1.4-082026-beta_Linux_x86_64.tar.gz ./go-rflink
+    tar -xzf go-rflink_{{ .Version }}_Linux_x86_64.tar.gz
+    ./go-rflink
     ```
-    # Windows x64
-    ```bash
-    unzip and run `go-rflink.exe`
+
+    ### Windows x64
+
+    ```powershell
+    Expand-Archive go-rflink_{{ .Version }}_Windows_x86_64.zip -DestinationPath .
+    .\go-rflink.exe
     ```
-    
+
     Released with [GoReleaser](https://github.com/goreleaser/goreleaser).
 
 # Multi-arch images via buildx (replaces dockers + docker_manifests).

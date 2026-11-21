@@ -6,6 +6,7 @@
 package rflink
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +33,41 @@ func TestParseTokenExpiryDays(t *testing.T) {
 	}
 	if _, err := parseTokenExpiry([]string{"", "", "nope"}, 2); err == nil {
 		t.Fatal("invalid expire accepted")
+	}
+}
+
+func TestAPITokenKeepsRFC3339AndRelativeExpiry(t *testing.T) {
+	got := parseAPIAuthTokens("ha:s3cretvalue:2026-12-01T15:04:05Z:read", "")
+	if len(got) != 1 || got[0].ExpiresAt == nil || len(got[0].Scopes) != 1 || got[0].Scopes[0] != "read" {
+		t.Fatalf("%#v", got)
+	}
+	want := time.Date(2026, 12, 1, 15, 4, 5, 0, time.UTC)
+	if !got[0].ExpiresAt.Equal(want) {
+		t.Fatalf("expiry %s", got[0].ExpiresAt)
+	}
+	plain := parseAPIAuthTokens("ha:s3cretvalue:2026-12-01T15:04:05Z", "")
+	if len(plain) != 1 || plain[0].ExpiresAt == nil || !plain[0].ExpiresAt.Equal(want) {
+		t.Fatalf("no scopes: %#v", plain)
+	}
+
+	dir := t.TempDir()
+	opts := &Options{RuntimeConfigFile: filepath.Join(dir, "runtime.json")}
+	opts.APIAuthTokens = "ops:supersecretvalue:30m:read"
+	rm, err := newRuntimeManager(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(rm.Stop)
+	if len(opts.apiTokens) != 1 || opts.apiTokens[0].ExpiresAt == nil {
+		t.Fatalf("%#v", opts.apiTokens)
+	}
+	first := *opts.apiTokens[0].ExpiresAt
+	time.Sleep(20 * time.Millisecond)
+	rm.mu.Lock()
+	rm.applyLocked()
+	rm.mu.Unlock()
+	if opts.apiTokens[0].ExpiresAt == nil || !opts.apiTokens[0].ExpiresAt.Equal(first) {
+		t.Fatalf("expiry moved from %s to %v", first, opts.apiTokens[0].ExpiresAt)
 	}
 }
 

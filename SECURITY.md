@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Security fixes are applied to the latest release and to `main`. Older tags are not patched in place.
+Security fixes are applied to the latest release and to `master`. Older tags are not patched in place.
 
 ## Reporting a vulnerability
 

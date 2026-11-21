@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -116,10 +117,28 @@ func (s *sessionStore) Get(id string) *session {
 func (s *sessionStore) Revoke(id string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.byID[id]; !ok {
+	if _, ok := s.byID[id]; ok {
+		delete(s.byID, id)
+		return true
+	}
+	// The session list shows a prefix, not the cookie. Revoke that prefix when
+	// it matches one live session. A shorter guess is rejected.
+	if len(id) < 8 {
 		return false
 	}
-	delete(s.byID, id)
+	match := ""
+	for key := range s.byID {
+		if strings.HasPrefix(key, id) {
+			if match != "" {
+				return false
+			}
+			match = key
+		}
+	}
+	if match == "" {
+		return false
+	}
+	delete(s.byID, match)
 	return true
 }
 
@@ -143,7 +162,7 @@ func (s *sessionStore) RevokeAllExcept(keepID string) int {
 	return n
 }
 
-func (s *sessionStore) List() []map[string]any {
+func (s *sessionStore) List(currentID string) []map[string]any {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
@@ -156,13 +175,16 @@ func (s *sessionStore) List() []map[string]any {
 		if len(prefix) > 8 {
 			prefix = prefix[:8]
 		}
-		out = append(out, map[string]any{
-			"id":         id,
+		item := map[string]any{
 			"id_prefix":  prefix,
 			"ip":         sess.IP,
 			"created_at": sess.CreatedAt.Format(time.RFC3339),
 			"expires_at": sess.ExpiresAt.Format(time.RFC3339),
-		})
+		}
+		if currentID != "" && id == currentID {
+			item["current"] = true
+		}
+		out = append(out, item)
 	}
 	return out
 }

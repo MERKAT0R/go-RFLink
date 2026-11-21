@@ -73,6 +73,7 @@ func startHTTPServer(app *App) (*httpAPIServer, error) {
 	// Probes — no auth, no CSRF
 	mux.HandleFunc("/healthz", h.handleHealthz)
 	mux.HandleFunc("/readyz", h.handleReadyz)
+	mux.HandleFunc("/metrics", h.protect(h.handleMetrics))
 
 	mux.HandleFunc("/api/v1/csrf", h.handleCSRF)
 	mux.HandleFunc("/api/v1/meta", h.handleMeta)
@@ -84,6 +85,7 @@ func startHTTPServer(app *App) (*httpAPIServer, error) {
 	mux.HandleFunc("/api/v1/rflink/raw/ws", h.handleRawWS)
 	mux.HandleFunc("/api/v1/command", h.protect(h.handleAPICommand))
 	mux.HandleFunc("/api/v1/ha/rediscover", h.protect(h.handleAPIRediscover))
+	mux.HandleFunc("/api/v1/ha/purge", h.protect(h.handleAPIPurge))
 	mux.HandleFunc("/api/v1/config", h.protect(h.handleAPIConfig))
 	mux.HandleFunc("/api/v1/config/restore", h.protect(h.handleConfigRestore))
 	mux.HandleFunc("/api/v1/config/backups", h.protect(h.handleConfigBackups))
@@ -255,7 +257,7 @@ func (h *httpAPIServer) checkScope(w http.ResponseWriter, r *http.Request) bool 
 
 func scopeForPath(method, path string) string {
 	switch path {
-	case "/api/v1/health", "/api/v1/sensors", "/api/v1/rflink/raw",
+	case "/metrics", "/api/v1/health", "/api/v1/sensors", "/api/v1/rflink/raw",
 		"/api/v1/rate_limit", "/api/v1/serial", "/api/v1/config/backups":
 		return "read"
 	case "/api/v1/config":
@@ -265,7 +267,7 @@ func scopeForPath(method, path string) string {
 		return "admin"
 	case "/api/v1/config/restore":
 		return "admin"
-	case "/api/v1/command", "/api/v1/ha/rediscover":
+	case "/api/v1/command", "/api/v1/ha/rediscover", "/api/v1/ha/purge":
 		return "command"
 	case "/api/v1/tokens", "/api/v1/sessions":
 		return "admin" // still requires GUI session via requireGUISession
@@ -513,7 +515,7 @@ func (h *httpAPIServer) middlewareAccessLog(next http.Handler) http.Handler {
 // isImportantHTTPRequest reports paths that should always appear at info when successful.
 func isImportantHTTPRequest(method, path string) bool {
 	switch path {
-	case "/api/v1/command", "/api/v1/ha/rediscover", "/api/v1/session",
+	case "/api/v1/command", "/api/v1/ha/rediscover", "/api/v1/ha/purge", "/api/v1/session",
 		"/api/v1/config/restore", "/api/v1/tokens", "/api/v1/sessions", "/api/v1/webhooks":
 		return true
 	case "/api/v1/config":
@@ -559,7 +561,7 @@ func (h *httpAPIServer) middlewareCORS(next http.Handler) http.Handler {
 			}
 			if allow {
 				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Token, X-CSRF-Token, X-Request-ID")
-				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 				w.Header().Set("Access-Control-Max-Age", "600")
 				w.Header().Set("Access-Control-Expose-Headers", headerRequestID)
 			}
@@ -699,7 +701,17 @@ func cookieSecure(r *http.Request, trusted []*net.IPNet) bool {
 	if ip == nil || !ipInNets(ip, trusted) {
 		return false
 	}
-	return strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https")
+	return strings.EqualFold(forwardedProto(r.Header.Get("X-Forwarded-Proto")), "https")
+}
+
+// forwardedProto is the scheme the client used. Proxies append hops, so
+// "https, http" still means the browser spoke HTTPS. Only the first value counts.
+func forwardedProto(header string) string {
+	header = strings.TrimSpace(header)
+	if i := strings.IndexByte(header, ','); i >= 0 {
+		header = header[:i]
+	}
+	return strings.TrimSpace(header)
 }
 
 func (h *httpAPIServer) cookieSecure(r *http.Request) bool {
@@ -866,6 +878,11 @@ func (h *httpAPIServer) sessionLogin(w http.ResponseWriter, r *http.Request) {
 	if ip == "" {
 		ip = r.RemoteAddr
 	}
+	want := strings.TrimSpace(h.app.opts.HTTP.AuthToken)
+	if want == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "gui_auth_not_configured"})
+		return
+	}
 	if ok, retry := h.loginLimit.allow(ip); !ok {
 		log.Info("session login rate-limited", "ip", ip, "retry_after_sec", int(retry.Seconds()))
 		w.Header().Set("Retry-After", fmt.Sprintf("%d", int(retry.Seconds())+1))
@@ -882,11 +899,6 @@ func (h *httpAPIServer) sessionLogin(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(body, &req)
 	if req.Token == "" {
 		req.Token = strings.TrimSpace(string(body))
-	}
-	want := strings.TrimSpace(h.app.opts.HTTP.AuthToken)
-	if want == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "gui_auth_not_configured"})
-		return
 	}
 	if !h.app.opts.guiTokenOK(req.Token) {
 		log.Info("session login failed", "ip", ip)
@@ -921,7 +933,10 @@ func (h *httpAPIServer) sessionLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sid := sessionIDFromRequest(r)
-	if sid != "" {
+	// Revoke only an exact cookie. A prefix match belongs to the signed-in
+	// session list: logout otherwise deletes whichever session starts with
+	// the eight characters shown in the log.
+	if sid != "" && h.app.sessions.Get(sid) != nil {
 		if h.app.sessions.Revoke(sid) {
 			log.Info("session revoked", "session_id_prefix", sid[:min(8, len(sid))], "ip", clientIPFrom(r.Context()))
 		}
@@ -999,24 +1014,39 @@ func (h *httpAPIServer) handleAPICommand(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	payload := strings.TrimSpace(string(body))
+	var targets []string
+	useTargets := false
 	if strings.HasPrefix(payload, "{") {
 		var obj struct {
-			Command string `json:"command"`
+			Command string    `json:"command"`
+			Devices *[]string `json:"devices"`
 		}
 		if err := json.Unmarshal(body, &obj); err == nil && obj.Command != "" {
 			payload = obj.Command
+			if obj.Devices != nil {
+				targets = *obj.Devices
+				useTargets = true
+			}
 		}
 	}
 	if payload == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "empty command"})
 		return
 	}
-	res := h.app.ExecuteCommand(payload)
+	var res CmdResult
+	if useTargets {
+		res = h.app.executeCommand(payload, "http", requestActor(r), targets)
+	} else {
+		res = h.app.ExecuteCommandFrom(payload, "http", requestActor(r))
+	}
 	status := http.StatusOK
 	switch res.Status {
-	case "rejected", "rate_limited":
+	case "rejected":
 		status = http.StatusBadRequest
-	case "serial_down", "error":
+	case "rate_limited":
+		w.Header().Set("Retry-After", "1")
+		status = http.StatusTooManyRequests
+	case "serial_down", "error", "partial", "stopping":
 		status = http.StatusServiceUnavailable
 	}
 	writeJSON(w, status, res)
@@ -1033,6 +1063,48 @@ func (h *httpAPIServer) handleAPIRediscover(w http.ResponseWriter, r *http.Reque
 	}
 	h.app.publisher.ClearHADiscovery()
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (h *httpAPIServer) handleAPIPurge(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.effectiveReadOnly() {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "read_only"})
+		return
+	}
+	n := 0
+	if h.app.publisher != nil {
+		n = h.app.publisher.PurgeHADiscovery()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "cleared": n})
+}
+
+func (h *httpAPIServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	body := ""
+	if h.app.publisher != nil {
+		body = h.app.publisher.MetricsText()
+	}
+	_, _ = io.WriteString(w, body)
+}
+
+func requestActor(r *http.Request) string {
+	if sid := sessionIDFromRequest(r); sid != "" {
+		if len(sid) > 8 {
+			sid = sid[:8]
+		}
+		return "session:" + sid
+	}
+	if tok, _ := r.Context().Value(ctxAPIToken).(*apiToken); tok != nil && tok.Name != "" {
+		return "token:" + tok.Name
+	}
+	return "http"
 }
 
 func (h *httpAPIServer) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
@@ -1077,17 +1149,24 @@ func (h *httpAPIServer) getConfig(w http.ResponseWriter, r *http.Request) {
 	_, src := h.app.runtime.snapshot()
 	o := h.app.opts
 	writeJSON(w, http.StatusOK, map[string]any{
-		"friendly_names":      h.effectiveFriendlyCSV(),
-		"ignore_list":         h.effectiveIgnoreCSV(),
-		"hwid_map":            h.effectiveHWIDCSV(),
-		"ha_discovery":        o.Publish.HomeAssistantDiscovery,
-		"ha_discovery_prefix": o.Publish.HADiscoveryPrefix,
-		"ha_buttons":          o.Publish.HAButtons,
-		"ha_switches":         o.Publish.HASwitches,
-		"source":              src,
-		"runtime_path":        h.app.runtime.pathString(),
-		"backups":             h.app.runtime.ListBackups(),
-		"note":                "When a key is stored in runtime file it fully overrides env for that key",
+		"friendly_names":         h.effectiveFriendlyCSV(),
+		"ignore_list":            h.effectiveIgnoreCSV(),
+		"hwid_map":               h.effectiveHWIDCSV(),
+		"ha_discovery":           o.Publish.HomeAssistantDiscovery,
+		"ha_discovery_prefix":    o.Publish.HADiscoveryPrefix,
+		"ha_buttons":             o.Publish.HAButtons,
+		"ha_switches":            o.Publish.HASwitches,
+		"min_interval_ms":        o.Publish.MinIntervalMs,
+		"throttle":               o.Publish.Throttle,
+		"ha_device_triggers":     o.Publish.HADeviceTriggers,
+		"ha_sensor_availability": o.Publish.HASensorAvailability,
+		"ha_sensor_stale_sec":    o.Publish.HASensorStaleSec,
+		"command_devices":        o.Serial.CommandDevices,
+		"serial_devices":         o.serialDeviceList(),
+		"source":                 src,
+		"runtime_path":           h.app.runtime.pathString(),
+		"backups":                h.app.runtime.ListBackups(),
+		"note":                   "When a key is stored in runtime file it fully overrides env for that key",
 	})
 }
 
@@ -1102,13 +1181,19 @@ func (h *httpAPIServer) putConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		FriendlyNames     *string `json:"friendly_names"`
-		IgnoreList        *string `json:"ignore_list"`
-		HWIDMap           *string `json:"hwid_map"`
-		HADiscovery       *bool   `json:"ha_discovery"`
-		HADiscoveryPrefix *string `json:"ha_discovery_prefix"`
-		HAButtons         *string `json:"ha_buttons"`
-		HASwitches        *string `json:"ha_switches"`
+		FriendlyNames        *string `json:"friendly_names"`
+		IgnoreList           *string `json:"ignore_list"`
+		HWIDMap              *string `json:"hwid_map"`
+		HADiscovery          *bool   `json:"ha_discovery"`
+		HADiscoveryPrefix    *string `json:"ha_discovery_prefix"`
+		HAButtons            *string `json:"ha_buttons"`
+		HASwitches           *string `json:"ha_switches"`
+		MinIntervalMs        *int    `json:"min_interval_ms"`
+		Throttle             *string `json:"throttle"`
+		HADeviceTriggers     *bool   `json:"ha_device_triggers"`
+		HASensorAvailability *bool   `json:"ha_sensor_availability"`
+		HASensorStaleSec     *int    `json:"ha_sensor_stale_sec"`
+		CommandDevices       *string `json:"command_devices"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
@@ -1168,6 +1253,42 @@ func (h *httpAPIServer) putConfig(w http.ResponseWriter, r *http.Request) {
 			patch.HASwitches = &v
 		}
 	}
+	if req.MinIntervalMs != nil {
+		if err := ValidateBoundedInt("min_interval_ms", *req.MinIntervalMs, 86400000); err != nil {
+			fieldErrs = append(fieldErrs, err.Error())
+		} else {
+			patch.MinIntervalMs = req.MinIntervalMs
+		}
+	}
+	if req.Throttle != nil {
+		v := strings.TrimSpace(*req.Throttle)
+		if err := ValidateThrottleCSV(v); err != nil {
+			fieldErrs = append(fieldErrs, err.Error())
+		} else {
+			patch.Throttle = &v
+		}
+	}
+	if req.HADeviceTriggers != nil {
+		patch.HADeviceTriggers = req.HADeviceTriggers
+	}
+	if req.HASensorAvailability != nil {
+		patch.HASensorAvailability = req.HASensorAvailability
+	}
+	if req.HASensorStaleSec != nil {
+		if err := ValidateBoundedInt("ha_sensor_stale_sec", *req.HASensorStaleSec, 86400); err != nil {
+			fieldErrs = append(fieldErrs, err.Error())
+		} else {
+			patch.HASensorStaleSec = req.HASensorStaleSec
+		}
+	}
+	if req.CommandDevices != nil {
+		v := strings.TrimSpace(*req.CommandDevices)
+		if err := ValidateCommandDevicesCSV(v); err != nil {
+			fieldErrs = append(fieldErrs, err.Error())
+		} else {
+			patch.CommandDevices = &v
+		}
+	}
 
 	disc := h.app.opts.Publish.HomeAssistantDiscovery
 	if req.HADiscovery != nil {
@@ -1204,18 +1325,25 @@ func (h *httpAPIServer) putConfig(w http.ResponseWriter, r *http.Request) {
 	)
 	_, src2 := h.app.runtime.snapshot()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"friendly_names":      h.effectiveFriendlyCSV(),
-		"ignore_list":         h.effectiveIgnoreCSV(),
-		"hwid_map":            h.effectiveHWIDCSV(),
-		"ha_discovery":        h.app.opts.Publish.HomeAssistantDiscovery,
-		"ha_discovery_prefix": h.app.opts.Publish.HADiscoveryPrefix,
-		"ha_buttons":          h.app.opts.Publish.HAButtons,
-		"ha_switches":         h.app.opts.Publish.HASwitches,
-		"source":              src2,
-		"first_time_keys":     first,
-		"warning":             firstTimeWarning(first),
-		"runtime_path":        h.app.runtime.pathString(),
-		"backups":             h.app.runtime.ListBackups(),
+		"friendly_names":         h.effectiveFriendlyCSV(),
+		"ignore_list":            h.effectiveIgnoreCSV(),
+		"hwid_map":               h.effectiveHWIDCSV(),
+		"ha_discovery":           h.app.opts.Publish.HomeAssistantDiscovery,
+		"ha_discovery_prefix":    h.app.opts.Publish.HADiscoveryPrefix,
+		"ha_buttons":             h.app.opts.Publish.HAButtons,
+		"ha_switches":            h.app.opts.Publish.HASwitches,
+		"min_interval_ms":        h.app.opts.Publish.MinIntervalMs,
+		"throttle":               h.app.opts.Publish.Throttle,
+		"ha_device_triggers":     h.app.opts.Publish.HADeviceTriggers,
+		"ha_sensor_availability": h.app.opts.Publish.HASensorAvailability,
+		"ha_sensor_stale_sec":    h.app.opts.Publish.HASensorStaleSec,
+		"command_devices":        h.app.opts.Serial.CommandDevices,
+		"serial_devices":         h.app.opts.serialDeviceList(),
+		"source":                 src2,
+		"first_time_keys":        first,
+		"warning":                firstTimeWarning(first),
+		"runtime_path":           h.app.runtime.pathString(),
+		"backups":                h.app.runtime.ListBackups(),
 	})
 }
 
@@ -1271,12 +1399,7 @@ func (h *httpAPIServer) handleSessions(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		cur := sessionIDFromRequest(r)
-		list := h.app.sessions.List()
-		for _, item := range list {
-			if id, _ := item["id"].(string); id == cur {
-				item["current"] = true
-			}
-		}
+		list := h.app.sessions.List(cur)
 		writeJSON(w, http.StatusOK, map[string]any{"sessions": list, "count": len(list)})
 	case http.MethodDelete:
 		body, _ := io.ReadAll(io.LimitReader(r.Body, maxBodyBytes))
@@ -1301,16 +1424,17 @@ func (h *httpAPIServer) handleSessions(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id or all required"})
 			return
 		}
+		self := cur != "" && (id == cur || (len(id) >= 8 && strings.HasPrefix(cur, id)))
 		if h.app.sessions.Revoke(id) {
 			log.Info("session revoked by admin",
 				"target_prefix", id[:min(8, len(id))],
 				"by_prefix", cur[:min(8, len(cur))],
 				"ip", clientIPFrom(r.Context()),
 			)
-			if id == cur {
+			if self {
 				clearSessionCookie(w, h.cookieSecure(r))
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"status": "revoked", "current": id == cur})
+			writeJSON(w, http.StatusOK, map[string]any{"status": "revoked", "current": self})
 			return
 		}
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
@@ -1337,10 +1461,12 @@ func (h *httpAPIServer) handleSerialInfo(w http.ResponseWriter, r *http.Request)
 		"ping_timeout_sec":    o.Serial.PingTimeoutSec,
 		"ping_fail_threshold": o.Serial.PingFailThreshold,
 		"connected":           snap.SerialConnected,
+		"ports":               snap.SerialPorts,
+		"command_devices":     o.Serial.CommandDevices,
 		"last_serial_at":      snap.LastSerialAt,
 		"last_pong_at":        snap.LastPongAt,
 		"rflink_unresponsive": snap.RFLinkUnresponsive,
-		"note":                "SERIAL_* is deploy-time config (env only); change requires restart",
+		"note":                "Port list is deploy-time config and needs a restart. Command targets can be saved from the GUI into the runtime file.",
 	})
 }
 
@@ -1544,11 +1670,18 @@ func (h *httpAPIServer) listAPITokens(w http.ResponseWriter) {
 	var list []map[string]any
 	tokens := h.app.opts.apiTokens
 	if src.APITokens == "runtime" {
+		live := map[string]struct{}{}
+		for _, tok := range tokens {
+			if tok.Hash != "" {
+				live[tok.Hash] = struct{}{}
+			}
+		}
 		for _, t := range file.APITokens {
+			_, active := live[t.TokenHash]
 			list = append(list, map[string]any{
 				"name": t.Name, "suffix": t.TokenSuffix,
 				"expires_at": t.ExpiresAt, "created_at": t.CreatedAt,
-				"scopes": t.Scopes,
+				"scopes": t.Scopes, "active": active,
 			})
 		}
 	} else {
@@ -1893,6 +2026,10 @@ td, th { text-align:left; padding:4px 6px; border-bottom:1px solid #243044; }
     <h2>Send command</h2>
     <div class="stack">
       <input id="cmd" placeholder="10;PING;" spellcheck="false"/>
+      <div id="portPick" class="stack" style="display:none">
+        <div class="hint">More than one board. Checked boards receive this send. All checked sends to every connected port.</div>
+        <div id="portChecks"></div>
+      </div>
       <button id="send">Send</button>
       <button type="button" class="secondary" id="rediscover">HA rediscover</button>
       <div id="cmdOut" class="mono"></div>
@@ -1922,6 +2059,25 @@ td, th { text-align:left; padding:4px 6px; border-bottom:1px solid #243044; }
       <textarea id="haBtn" placeholder="Siren On:10;NewKaku;123456;ON;" rows="2" spellcheck="false"></textarea>
       <label class="hint">HA switches (Label:on:off,…)</label>
       <textarea id="haSw" placeholder="Garden Light:10;NewKaku;AABB;ON;:10;NewKaku;AABB;OFF;" rows="2" spellcheck="false"></textarea>
+      <label class="hint">Min interval ms (same HWID, 0 = off)</label>
+      <input id="minInt" inputmode="numeric" placeholder="0" spellcheck="false"/>
+      <label class="hint">Throttle (HWID:ms,…)</label>
+      <textarea id="thr" placeholder="OREGON_0001:5000" rows="2" spellcheck="false"></textarea>
+      <label class="toggle" title="PUBLISH_HA_DEVICE_TRIGGERS">
+        <input type="checkbox" id="haTrig"/>
+        <span class="knob"></span>
+        <span class="lbl">HA device triggers</span>
+      </label>
+      <label class="toggle" title="PUBLISH_HA_SENSOR_AVAILABILITY">
+        <input type="checkbox" id="haAvail"/>
+        <span class="knob"></span>
+        <span class="lbl">Per-sensor availability</span>
+      </label>
+      <label class="hint">Sensor stale seconds (0 = never offline)</label>
+      <input id="staleSec" inputmode="numeric" placeholder="0" spellcheck="false"/>
+      <label class="hint">Boards that receive commands (empty = every connected port)</label>
+      <input id="cmdDev" placeholder="COM3,tcp://192.168.1.20:9999" spellcheck="false"/>
+      <div class="hint">Saving a key here writes it into the runtime file. After that, env is ignored for that key. The save response names every key that switched on this save.</div>
       <button id="saveCfg" class="secondary">Save config</button>
       <div id="cfgOut" class="mono"></div>
       <div class="hint">Backups (last 3)</div>
@@ -2035,6 +2191,9 @@ let ws = null;
 let wsTimer = null;
 let sessionOK = false;
 let cfgDirty = false;
+let cfgReady = false;
+let cmdDevFromPicker = '';
+let lastPorts = [];
 let cfgForce = false;
 let cfgEpoch = 0;
 let whEpoch = 0;
@@ -2097,13 +2256,15 @@ $('authBtn').onclick = async () => {
 };
 $('token').addEventListener('keydown', e => { if (e.key === 'Enter') $('authBtn').click(); });
 document.addEventListener('change', e => {
-  if (e.target && e.target.id === 'haDisc' && e.target.checked) {
-    if (!($('haPfx').value||'').trim()) $('haPfx').value = 'homeassistant';
+  if (!cfgReady) return;
+  if (e.target && (e.target.classList && e.target.classList.contains('port-pick') || ['fn','ig','haDisc','haPfx','haBtn','haSw','minInt','thr','haTrig','haAvail','staleSec','cmdDev'].includes(e.target.id))) {
+    if (e.target.classList && e.target.classList.contains('port-pick')) syncCmdDevFromPicker();
+    cfgDirty = true; cfgEpoch++;
   }
-  if (e.target && ['fn','ig','haDisc','haPfx','haBtn','haSw'].includes(e.target.id)) { cfgDirty = true; cfgEpoch++; }
 });
 document.addEventListener('input', e => {
-  if (e.target && ['fn','ig','haPfx','haBtn','haSw'].includes(e.target.id)) { cfgDirty = true; cfgEpoch++; }
+  if (!cfgReady) return;
+  if (e.target && ['fn','ig','haPfx','haBtn','haSw','minInt','thr','staleSec','cmdDev'].includes(e.target.id)) { cfgDirty = true; cfgEpoch++; }
 });
 
 $('serial').onclick = async () => {
@@ -2118,12 +2279,14 @@ $('serial').onclick = async () => {
       ['device', info.device],
       ['baud', info.baud],
       ['connected', info.connected],
+      ['command_devices', info.command_devices || '(every connected port)'],
       ['last_serial_at', info.last_serial_at],
       ['last_pong_at', info.last_pong_at],
       ['watchdog_sec', info.watchdog_sec],
       ['ping_interval_sec', info.ping_interval_sec],
       ['note', info.note || ''],
     ];
+    if (Array.isArray(info.ports)) info.ports.forEach(p => rows.push([p.device, p.connected ? 'online' : 'offline']));
     await confirmDialog('Serial connection', rows.map(([k,v]) => k+': '+(v===undefined||v===null?'':v)).join(String.fromCharCode(10)));
   } catch(e) {
     await confirmDialog('Serial connection', e.message || 'unavailable');
@@ -2289,12 +2452,15 @@ function esc(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+function rawLineText(l) {
+  return (l.at||'') + '  ' + (l.device ? l.device + '  ' : '') + (l.message||'');
+}
 function renderRaw() {
   const filter = ($('rawFilter').value || '').trim().toLowerCase();
   let lines = window.__rawLines || [];
-  if (filter) lines = lines.filter(l => (l.message||'').toLowerCase().includes(filter) || (l.at||'').toLowerCase().includes(filter));
+  if (filter) lines = lines.filter(l => rawLineText(l).toLowerCase().includes(filter));
   const view = lines.slice(-200);
-  $('raw').textContent = view.map(l => l.at + '  ' + l.message).join(String.fromCharCode(10)) || '(empty)';
+  $('raw').textContent = view.map(rawLineText).join(String.fromCharCode(10)) || '(empty)';
   $('raw').scrollTop = $('raw').scrollHeight;
   $('rawMeta').textContent = (window.__rawLines||[]).length + ' buffered' + (filter ? ' / ' + lines.length + ' matched' : '');
 }
@@ -2321,7 +2487,7 @@ function ensureWS() {
       window.__rawLines = msg.buffer;
       renderRaw();
     } else if (msg.type === 'line') {
-      window.__rawLines.push({at: msg.at, message: msg.message});
+      window.__rawLines.push({at: msg.at, message: msg.message, device: msg.device||''});
       if (window.__rawLines.length > 500) window.__rawLines = window.__rawLines.slice(-400);
       renderRaw();
     }
@@ -2339,14 +2505,31 @@ async function tickHealth() {
     const h = await j('/api/v1/health');
     $('ver').textContent = (h.version||'?') + ' @ ' + (h.git_sha||'?');
     badge($('mqtt'), h.mqtt_connected, h.mqtt_connected ? 'MQTT up' : 'MQTT down');
-    badge($('serial'), h.serial_connected, h.serial_connected ? 'Serial up' : 'Serial down');
+    const ports = Array.isArray(h.serial_ports) ? h.serial_ports : [];
+    if (ports.length > 1) {
+      const up = ports.filter(p => p.connected).length;
+      badge($('serial'), h.serial_connected, 'Serial '+up+'/'+ports.length);
+    } else {
+      const q = ports[0] && ports[0].queue_cap ? ' '+(ports[0].queued||0)+'/'+ports[0].queue_cap : '';
+      const dropped = ports[0] && ports[0].dropped ? ' dropped '+ports[0].dropped : '';
+      badge($('serial'), h.serial_connected, (h.serial_connected ? 'Serial up' : 'Serial down') + q + dropped);
+    }
     badge($('rflink'), !h.rflink_unresponsive, h.rflink_unresponsive ? 'RFLink unresponsive' : 'RFLink OK');
     $('uptime').textContent = 'up ' + (h.uptime_sec||0) + 's';
     const rows = [
-      ['published', h.published], ['dedup_dropped', h.dedup_dropped], ['serial_stale', h.serial_stale],
+      ['published', h.published], ['dedup_dropped', h.dedup_dropped], ['serial_dropped', h.serial_dropped], ['throttle_dropped', h.throttle_dropped], ['serial_stale', h.serial_stale],
       ['last_sensor', (h.last_sensor_hwid||'') + ' ' + (h.last_sensor_at||'')],
       ['last_serial', h.last_serial_at||''], ['last_pong', h.last_pong_at||''], ['ping_fails', h.ping_fails],
     ];
+    if (ports.length > 1) ports.forEach(p => {
+      let label = p.connected ? 'online' : 'offline';
+      if (p.version) label += ' ' + p.version;
+      if (p.queue_cap) label += ' ' + (p.queued||0) + '/' + p.queue_cap;
+      if (p.dropped) label += ', dropped ' + p.dropped;
+      rows.push([p.device, label]);
+    });
+    else if (ports.length === 1 && ports[0].version) rows.push(['version', ports[0].version]);
+    renderPortPicker(ports);
     $('health').innerHTML = rows.map(([k,v]) => '<div class="row"><span>'+esc(k)+'</span><span>'+esc(v)+'</span></div>').join('');
   } catch(e) {
     if (e.status === 401) $('health').innerHTML = '<span class="err">'+(e.message||'Unauthorized')+'</span>';
@@ -2388,18 +2571,31 @@ async function tickConfig() {
     if (epoch === cfgEpoch) {
       if (!cfgDirty) {
         const active = document.activeElement;
-        if (force || active !== $('fn')) $('fn').value = c.friendly_names||'';
-        if (force || active !== $('ig')) $('ig').value = c.ignore_list||'';
-        if (force || active !== $('haPfx')) $('haPfx').value = c.ha_discovery_prefix||'homeassistant';
-        if (force || active !== $('haBtn')) $('haBtn').value = c.ha_buttons||'';
-        if (force || active !== $('haSw')) $('haSw').value = c.ha_switches||'';
-        if (force || active !== $('haDisc')) $('haDisc').checked = !!c.ha_discovery;
+        const fillText = (el, value) => { if (!cfgReady || force || active !== el) el.value = value; };
+        const fillCheck = (el, value) => { if (!cfgReady || force || active !== el) el.checked = value; };
+        fillText($('fn'), c.friendly_names||'');
+        fillText($('ig'), c.ignore_list||'');
+        fillText($('haPfx'), c.ha_discovery_prefix||'');
+        fillText($('haBtn'), c.ha_buttons||'');
+        fillText($('haSw'), c.ha_switches||'');
+        fillCheck($('haDisc'), !!c.ha_discovery);
+        fillText($('minInt'), String(c.min_interval_ms||0));
+        fillText($('thr'), c.throttle||'');
+        fillText($('staleSec'), String(c.ha_sensor_stale_sec||0));
+        fillText($('cmdDev'), c.command_devices||'');
+        fillCheck($('haTrig'), !!c.ha_device_triggers);
+        fillCheck($('haAvail'), !!c.ha_sensor_availability);
+        cmdDevFromPicker = ($('cmdDev').value||'').trim();
+        cfgReady = true;
+        if (lastPorts.length > 1) renderPortPicker(lastPorts);
       }
       renderBackups(c.backups || []);
       if (c.source) {
         $('cfgSource').textContent = 'source: friendly='+(c.source.friendly_names||'?')+
           ' ignore='+(c.source.ignore_list||'?')+
           ' ha='+(c.source.ha_discovery||'?')+
+          ' min='+(c.source.min_interval_ms||'?')+
+          ' cmd='+(c.source.command_devices||'?')+
           ' path='+(c.runtime_path||'');
       }
     }
@@ -2431,7 +2627,7 @@ async function tickSessions() {
       const cur = s.current ? ' <span class="ok">current</span>' : '';
       return '<div class="hist-row"><code>'+esc(s.id_prefix)+'…</code>'+
         '<span class="hint">'+esc(s.ip||'')+' '+esc(s.expires_at||'')+cur+'</span>'+
-        (s.current ? '' : '<button type="button" class="secondary iconbtn" data-sid="'+esc(s.id)+'">Revoke</button>')+
+        (s.current ? '' : '<button type="button" class="secondary iconbtn" data-sid="'+esc(s.id_prefix)+'">Revoke</button>')+
         '</div>';
     }).join('');
     $('sessList').querySelectorAll('button[data-sid]').forEach(btn => {
@@ -2465,12 +2661,13 @@ async function tickTokens() {
       const scopes = (t.scopes && t.scopes.length) ? t.scopes : ['read','command'];
       const scopePills = scopes.map(s => '<span class="pill scope">'+esc(s)+'</span>').join('');
       const env = t.from_env ? '<span class="pill">env</span>' : '';
+      const dead = t.active === false ? '<span class="pill">inactive</span>' : '';
       return '<div class="hist-row"><code>'+esc(t.name)+'</code>'+
         '<span class="pills">'+
           '<span class="pill suffix" title="token suffix">…'+esc(t.suffix||'')+'</span>'+
           scopePills+
           '<span class="pill exp">exp '+esc(String(exp))+'</span>'+
-          env+
+          env+dead+
         '</span>'+
         '<button type="button" class="secondary iconbtn" data-del="'+esc(t.name)+'" title="Delete">✕</button></div>';
     }).join('');
@@ -2616,6 +2813,36 @@ function validateHAButtonsCSV(raw) {
   }
   return '';
 }
+function validateBoundedInt(raw, label, max) {
+  raw = (raw || '').trim();
+  if (!raw) return '';
+  if (!/^\d+$/.test(raw)) return label+': want a number';
+  if (Number(raw) > max) return label+': max '+max;
+  return '';
+}
+function validateThrottleCSV(raw) {
+  raw = (raw || '').trim();
+  if (!raw) return '';
+  const parts = raw.split(',').map(s => s.trim()).filter(Boolean);
+  if (parts.length > 64) return 'throttle: too many entries';
+  for (const part of parts) {
+    const i = part.indexOf(':');
+    if (i < 1) return 'throttle: want HWID:milliseconds in "'+part+'"';
+    const hwid = part.slice(0, i).trim();
+    const ms = part.slice(i+1).trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(hwid)) return 'throttle: bad HWID "'+hwid+'"';
+    if (!/^\d+$/.test(ms) || Number(ms) < 1 || Number(ms) > 86400000) return 'throttle: milliseconds for "'+hwid+'" must be 1..86400000';
+  }
+  return '';
+}
+function validateCommandDevicesCSV(raw) {
+  raw = (raw || '').trim();
+  if (!raw) return '';
+  const parts = raw.split(',').map(s => s.trim()).filter(Boolean);
+  if (parts.length > 16) return 'command_devices: too many';
+  for (const part of parts) if (part.length > 256) return 'command_devices: name too long';
+  return '';
+}
 function validateHASwitchesCSV(raw) {
   raw = (raw || '').trim();
   if (!raw) return '';
@@ -2634,6 +2861,46 @@ function validateHASwitchesCSV(raw) {
   return '';
 }
 
+function syncCmdDevFromPicker() {
+  const boxes = [...document.querySelectorAll('#portChecks input.port-pick')];
+  if (!boxes.length || !$('cmdDev')) return;
+  let checked = boxes.filter(b => b.checked);
+  if (!checked.length) {
+    const back = boxes.find(b => b === document.activeElement) || boxes[0];
+    back.checked = true;
+    checked = [back];
+  }
+  if (checked.length === boxes.length) { $('cmdDev').value = ''; cmdDevFromPicker = ''; return; }
+  $('cmdDev').value = checked.map(b => b.value).join(',');
+  cmdDevFromPicker = $('cmdDev').value;
+}
+function renderPortPicker(ports) {
+  lastPorts = Array.isArray(ports) ? ports : [];
+  const box = $('portPick');
+  const host = $('portChecks');
+  if (!box || !host) return;
+  if (!ports || ports.length < 2) { box.style.display = 'none'; return; }
+  box.style.display = '';
+  const names = ports.map(p => p.device).join('\n');
+  const prev = {};
+  host.querySelectorAll('input.port-pick').forEach(el => { prev[el.value] = el.checked; });
+  const raw = ($('cmdDev') && $('cmdDev').value || '').trim();
+  const keep = cfgDirty && host.dataset.names === names && raw === cmdDevFromPicker;
+  host.dataset.names = names;
+  const want = raw ? raw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean) : null;
+  host.innerHTML = ports.map(p => {
+    let on;
+    if (keep && Object.prototype.hasOwnProperty.call(prev, p.device)) on = prev[p.device];
+    else on = !want || want.indexOf(String(p.device).toLowerCase()) >= 0;
+    const state = p.connected ? 'online' : 'offline';
+    return '<label class="hint"><input type="checkbox" class="port-pick" value="'+esc(p.device)+'"'+(on?' checked':'')+'> '+esc(p.device)+' · '+state+'</label>';
+  }).join('');
+}
+function selectedCommandDevices() {
+  const box = $('portPick');
+  if (!box || box.style.display === 'none') return null;
+  return [...document.querySelectorAll('#portChecks input.port-pick:checked')].map(el => el.value);
+}
 async function sendCommand(cmd) {
   if (cmdBusy) return;
   const verr = validateRFLinkCmd(cmd);
@@ -2647,7 +2914,20 @@ async function sendCommand(cmd) {
   $('cmdOut').textContent = 'sending…';
   try {
     await ensureCSRF();
-    const res = await j('/api/v1/command', {method:'POST', headers:{'Content-Type':'text/plain'}, body: cmd});
+    if (lastPorts.length > 1) renderPortPicker(lastPorts);
+    let body = cmd;
+    let headers = {'Content-Type':'text/plain'};
+    const picked = selectedCommandDevices();
+    if (picked) {
+      if (!picked.length) {
+        $('cmdOut').className = 'mono err';
+        $('cmdOut').textContent = 'select at least one board';
+        return;
+      }
+      body = JSON.stringify({command: cmd, devices: picked});
+      headers = {'Content-Type':'application/json'};
+    }
+    const res = await j('/api/v1/command', {method:'POST', headers: headers, body: body});
     $('cmdOut').className = 'mono ' + (res.status==='ok'?'ok':'err');
     $('cmdOut').textContent = JSON.stringify(res);
     pushHist(res.command || cmd, res.status);
@@ -2690,11 +2970,18 @@ $('rediscover').onclick = async () => {
 
 $('saveCfg').onclick = async () => {
   if (authBlocked || readOnly) { $('cfgOut').className='mono err'; $('cfgOut').textContent = readOnly?'read-only':'Login required'; return; }
+  if (!cfgReady) { $('cfgOut').className='mono err'; $('cfgOut').textContent = 'config still loading'; return; }
+  const pickedNow = selectedCommandDevices();
+  if (pickedNow && !pickedNow.length) { $('cfgOut').className='mono err'; $('cfgOut').textContent = 'select at least one board'; return; }
   const errs = [
     validateFriendlyCSV($('fn').value),
     validateIgnoreCSV($('ig').value),
     validateHAButtonsCSV($('haBtn').value),
     validateHASwitchesCSV($('haSw').value),
+    validateBoundedInt($('minInt').value, 'min_interval_ms', 86400000),
+    validateThrottleCSV($('thr').value),
+    validateBoundedInt($('staleSec').value, 'ha_sensor_stale_sec', 86400),
+    validateCommandDevicesCSV($('cmdDev').value),
   ].filter(Boolean);
   if (errs.length) {
     $('cfgOut').className = 'mono err';
@@ -2713,7 +3000,13 @@ $('saveCfg').onclick = async () => {
         ha_discovery: $('haDisc').checked,
         ha_discovery_prefix: pfx,
         ha_buttons: $('haBtn').value,
-        ha_switches: $('haSw').value
+        ha_switches: $('haSw').value,
+        min_interval_ms: Number(($('minInt').value||'0').trim()||'0'),
+        throttle: $('thr').value,
+        ha_device_triggers: $('haTrig').checked,
+        ha_sensor_availability: $('haAvail').checked,
+        ha_sensor_stale_sec: Number(($('staleSec').value||'0').trim()||'0'),
+        command_devices: ($('cmdDev').value||'').trim()
       }) });
     if (epoch === cfgEpoch) cfgDirty = false;
     $('cfgOut').className = 'mono ok';
@@ -2768,8 +3061,8 @@ function renderBackups(list) {
 function rawTextFull() {
   const filter = ($('rawFilter').value || '').trim().toLowerCase();
   let lines = window.__rawLines || [];
-  if (filter) lines = lines.filter(l => (l.message||'').toLowerCase().includes(filter) || (l.at||'').toLowerCase().includes(filter));
-  return lines.map(l => l.at + '  ' + l.message).join(String.fromCharCode(10));
+  if (filter) lines = lines.filter(l => rawLineText(l).toLowerCase().includes(filter));
+  return lines.map(rawLineText).join(String.fromCharCode(10));
 }
 function flashRawAction(msg, ok) {
   const el = $('rawActionOut'); el.textContent = msg; el.className = 'mono ' + (ok?'ok':'err');
@@ -2812,7 +3105,7 @@ async function bootstrap() {
     }
   } catch(e) {}
   if (!authBlocked && !meta.gui_locked) {
-    await tickHealth(); await tickSensors(); await tickRate(); await tickConfig();
+    await tickConfig(); await tickHealth(); await tickSensors(); await tickRate();
     ensureWS();
   } else if (!meta.gui_locked) {
     // still show health only after login

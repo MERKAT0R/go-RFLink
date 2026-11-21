@@ -142,8 +142,11 @@ func (h *httpAPIServer) handleRawWS(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return
 			}
+			if !h.wsStillAllowed(sid, token) {
+				return
+			}
 			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := conn.WriteJSON(map[string]any{"type": "line", "at": entry.At, "message": entry.Message}); err != nil {
+			if err := conn.WriteJSON(map[string]any{"type": "line", "at": entry.At, "device": entry.Device, "message": entry.Message}); err != nil {
 				return
 			}
 		}

@@ -105,10 +105,10 @@ func SensorDataFromMessage(msg string) (*SensorData, error) {
 			temp := tempCelsiusFromRFLink(t)
 			sd.Temperature = &temp
 		case "HUM":
-			// Decimal plugins use 0-9; hex plugins (LaCrosse %02x) include a-f.
-			// A bad humidity field must not drop TEMP/ID from the same frame.
+			// Decimal plugins use 0-9. Hex plugins (LaCrosse, UPM/Esic F2, %02x)
+			// stay hex even when the digits are only 0-9, so HUM=32 is 50%.
 			base := 10
-			if strings.ContainsAny(strings.ToLower(value), "abcdef") {
+			if humidityIsHex(sd.Model, value) {
 				base = 16
 			}
 			h, err := strToUint16(value, base)
@@ -134,11 +134,17 @@ func SensorDataFromMessage(msg string) (*SensorData, error) {
 }
 
 // ApplyCanonicalHWID rewrites Hwid using the configured ID→HWID map when present.
+// A second call keeps using the original HWID. Looking up the already rewritten
+// name would miss and fall through to the bare ID, which can name a different device.
 func (sd *SensorData) ApplyCanonicalHWID(o *Options) {
-	if o == nil {
+	if sd == nil || o == nil {
 		return
 	}
-	sd.Hwid = o.CanonicalHWID(sd.Id, sd.Hwid)
+	base := sd.Hwid
+	if sd.RawHWID != "" {
+		base = sd.RawHWID
+	}
+	sd.Hwid = o.CanonicalHWID(sd.Id, base)
 }
 
 func isMomentaryState(v string) bool {
@@ -239,12 +245,27 @@ func fieldTopicName(key string) string {
 }
 
 // tempCelsiusFromRFLink decodes an RFLink TEMP word.
-// The top bit is a sign flag, not two's complement: 0x8066 is −10.2°C, not 3287.0°C.
+// The usual encoding is a sign flag plus a magnitude: 0x8066 is −10.2°C.
+// UPM/Esic prints a signed int with %04x, so −1.0°C arrives as fff6. A
+// magnitude above 100.0°C is not the sign-flag form, so that word is a
+// two's-complement tenth of a degree.
 func tempCelsiusFromRFLink(raw uint16) float32 {
 	if raw&0x8000 != 0 {
-		return -float32(raw&0x7FFF) / 10
+		mag := raw & 0x7FFF
+		if mag > 0x3E8 {
+			return float32(int16(raw)) / 10
+		}
+		return -float32(mag) / 10
 	}
 	return float32(raw) / 10
+}
+
+func humidityIsHex(model, value string) bool {
+	if strings.ContainsAny(strings.ToLower(value), "abcdef") {
+		return true
+	}
+	m := strings.ToUpper(model)
+	return strings.Contains(m, "LACROSSE") || strings.Contains(m, "ESIC_F2")
 }
 
 // String outputs a string representing the SensorData.
@@ -276,9 +297,11 @@ func (sd *SensorData) String() string {
 	return fmt.Sprintf(format, args...)
 }
 
-// GatewayInfo is published to {topic}/gateway/info.
+// GatewayInfo is published to {topic}/gateway/info, or {topic}/gateway/<name>/info
+// when more than one gateway is configured.
 type GatewayInfo struct {
 	Raw        string            `json:"raw"`
+	Device     string            `json:"device,omitempty"`
 	Version    string            `json:"version,omitempty"`
 	Pong       bool              `json:"pong,omitempty"`
 	ReceivedAt string            `json:"received_at"`
@@ -338,6 +361,20 @@ func ParseGatewayMessage(msg string) (*GatewayInfo, error) {
 			default:
 				info.Extra[strings.ToLower(key)] = val
 			}
+			continue
+		}
+		// Stock firmware answers 10;version; with a banner and no VER= field:
+		// "RFLink Gateway V1.1 - R48".
+		if info.Version == "" && strings.Contains(upper, "RFLINK") && strings.ContainsAny(piece, "0123456789") {
+			info.Version = piece
+			hasVer = true
+		}
+	}
+	if info.Version == "" {
+		if rev := info.Extra["rev"]; rev != "" {
+			info.Version = rev
+		} else if build := info.Extra["build"]; build != "" {
+			info.Version = build
 		}
 	}
 

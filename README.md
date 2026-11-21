@@ -1,3 +1,5 @@
+<a id="scorecard"></a>
+
 [![CI](https://github.com/MERKAT0R/go-RFLink/actions/workflows/goRFLink.yml/badge.svg)](https://github.com/MERKAT0R/go-RFLink/actions/workflows/goRFLink.yml)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/MERKAT0R/go-RFLink/badge)](https://scorecard.dev/viewer/?uri=github.com/MERKAT0R/go-RFLink)
 [![Go](https://img.shields.io/badge/Go-1.27.4-00ADD8?logo=go&logoColor=white)](https://go.dev/dl/)
@@ -10,6 +12,8 @@
 [![Assisted by Grok](https://img.shields.io/badge/Assisted%20by-Grok%20(xAI)-111111?logo=x&logoColor=white)](https://x.ai)
 
 # go-rflink
+[![Open your Home Assistant instance and show the add app repository dialog with a specific repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2FMERKAT0R%2Fgo-RFLink)
+[![Unraid template](https://img.shields.io/badge/Unraid-template-F15A2C?logo=unraid&logoColor=white)](https://raw.githubusercontent.com/MERKAT0R/go-RFLink/master/deploy/unraid/go-rflink.xml)
 
 Bridge [RFLink](https://www.rflink.nl/) Gateway serial traffic to MQTT (MQTT 5 via [paho.golang/autopaho](https://github.com/eclipse-paho/paho.golang)).
 
@@ -57,11 +61,13 @@ Base topic default: `rflink`.
 | `rflink/{HWID}/sw_{N}` | pub | Button/channel `N` state (`ON`/`OFF`) |
 | `rflink/{HWID}/sumJson` | pub | Full sensor JSON |
 | `rflink/send` | sub | Commands to RFLink (override with `PUBLISH_CMD_TOPIC`) |
-| `rflink/cmd/result` | pub | Command outcome (`ok`, `rejected`, `rate_limited`, …) |
+| `rflink/cmd/result` | pub | Command outcome (`ok`, `partial`, `rejected`, `rate_limited`, …) |
 | `rflink/status` | pub | Process/MQTT availability (`online`/`offline`) |
-| `rflink/serial/status` | pub | Serial port availability |
-| `rflink/health` | pub | Metrics JSON |
-| `rflink/gateway/info` | pub | Version / PONG |
+| `rflink/serial/status` | pub | Aggregate serial availability. With one gateway this is that port. With several it is `online` only when every port is up. Retained `online` is refreshed every 30s and expires after 90s, so a hard kill does not leave the topic online. A clean stop publishes `offline`, and that value stays |
+| `rflink/serial/<name>/status` | pub | One gateway, only when more than one is configured. Same 90s expiry on `online`. Home Assistant sensors follow the gateway that owns them |
+| `rflink/serial/command/status` | pub | `online` when any command target is connected. Buttons and switches use it once more than one gateway is configured. Same 90s expiry on `online` |
+| `rflink/health` | pub | Metrics JSON, including per-port queue fill (`queued` / `queue_cap`). Refreshed at least every 30s and retained for 90s, so a hard kill drops the snapshot. A clean stop clears it |
+| `rflink/gateway/info` | pub | Version / PONG for one gateway. With several gateways each board publishes `rflink/gateway/<name>/info` and this shared topic is cleared |
 | `rflink/admin/rediscover` | sub | Clear HA discovery cache (when HA discovery enabled) |
 
 ### sumJson example
@@ -79,16 +85,21 @@ Base topic default: `rflink`.
 }
 ```
 
+<a id="quick-best-start"></a>
+
 ## Quick best start
 
 ```bash
-# optional: source env.sh.example after editing
+# optional: copy env.sh.example to .env (already-set variables win) or source it
+# cp env.sh.example .env
 export PUBLISH_HOST="mqtt.ip.address:1883"
 export PUBLISH_SCHEME="mqtt"
 export PUBLISH_MQTT_USERNAME="gorflink"
 export PUBLISH_MQTT_PASSWORD="super-strong-mqtt-password"
 export PUBLISH_HOME_ASSISTANT_DISCOVERY=true
+# UART, or a networked RFLink: tcp://192.168.1.20:9999
 export SERIAL_DEVICE=/dev/ttyACM0      # for ex. /dev/serial/by-id/usb-Prolific_Technology_Inc._USB-Serial_Controller_D-if00-port0 or COM4
+# export SERIAL_DEVICES=tcp://192.168.1.21:9999
 export HTTP_LISTEN=127.0.0.1:8080
 export HTTP_AUTH_TOKEN='use-a-long-random-secret-16+'
 
@@ -114,6 +125,8 @@ Commands are trimmed, `;` is appended if missing, RFLink format is checked ([pro
 
 Valid examples: `10;PING;`, `10;NewKaku;0cac142;3;ON;`, `11;20;01;LacrosseV4;ID=0002;TEMP=00cd;` (echo/resend).
 
+<a id="home-assistant"></a>
+
 ### Home Assistant
 
 ```bash
@@ -121,11 +134,24 @@ export PUBLISH_HOME_ASSISTANT_DISCOVERY=true
 export PUBLISH_FRIENDLY_NAMES="EV1527_0B25F2:Front Door Remote"
 export PUBLISH_HA_BUTTONS="Siren:10;NewKaku;123456;ON;"
 export PUBLISH_HA_SWITCHES="Garden:10;NewKaku;AABB;ON;:10;NewKaku;AABB;OFF;"
+# device_automation triggers next to momentary sw_* sensors (default on)
+export PUBLISH_HA_DEVICE_TRIGGERS=true
+# per-sensor availability is off until you want it; then rediscover
+# export PUBLISH_HA_SENSOR_AVAILABILITY=true
+# export PUBLISH_HA_SENSOR_STALE_SEC=3600
+# chatty sensor: at most one publish per 10s, others keep the default gap
+# export PUBLISH_MIN_INTERVAL_MS=0
+# export PUBLISH_THROTTLE="EV1527_0B25F2:10000"
 ```
 
 - Device name defaults to `goRFLink_{MODEL} {ID}` if no friendly name is set
+- With one gateway, entity availability stays `rflink/status` and `rflink/serial/status`. With several, a sensor follows the gateway that last delivered a new frame. A second gateway takes over after 5 seconds of silence from the current one, or at once if that port is down, so overlapping radios do not rewrite discovery on the same burst. Buttons and switches stay available while any command target is up. The next frame republishes discovery when ownership moves; `unique_id` does not change
 - Entity names are short (`Temperature`, `Button 04`) to avoid doubled HA entity_ids
+- Switches stay optimistic. When a later RX frame repeats the switch id and `ON`/`OFF`, state is published to `rflink/gateway/switch/gorflink_sw_N/state`
 - Rediscover: `mosquitto_pub -t rflink/admin/rediscover -m 1` (or HTTP `POST /api/v1/ha/rediscover`)
+- Purge topics this process published: `POST /api/v1/ha/purge`. A topic left by an older process: `./scripts/purge-ha-discovery.sh homeassistant/sensor/gorflink_oregon_0001_temp/config`
+
+<a id="tls"></a>
 
 ### TLS
 
@@ -133,7 +159,12 @@ export PUBLISH_HA_SWITCHES="Garden:10;NewKaku;AABB;ON;:10;NewKaku;AABB;OFF;"
 export PUBLISH_SCHEME=ssl
 export PUBLISH_HOST=mqtt.example.com:8883
 export PUBLISH_TLS_CA_FILE=/path/to/ca.crt
+# optional mTLS — set both, or neither
+export PUBLISH_TLS_CERT_FILE=/path/to/client.crt
+export PUBLISH_TLS_KEY_FILE=/path/to/client.key
 ```
+
+<a id="http-api"></a>
 
 ### HTTP API & Web GUI
 
@@ -144,6 +175,13 @@ export HTTP_AUTH_TOKEN='use-a-long-random-secret'
 
 Then open `http://127.0.0.1:8080/` and log in.
 
+```bash
+# Prometheus text, scope read
+curl -s -H "Authorization: Bearer $API_TOKEN" http://127.0.0.1:8080/metrics
+# drop discovery configs this process still remembers, scope command
+curl -s -X POST -H "Authorization: Bearer $API_TOKEN" http://127.0.0.1:8080/api/v1/ha/purge
+```
+
 **Full HTTP documentation:** [`HTTP.md`](HTTP.md) — auth model, scopes, routes, runtime overlay, sessions, webhooks, security notes.
 
 <details>
@@ -152,8 +190,10 @@ Then open `http://127.0.0.1:8080/` and log in.
 | Item | Detail |
 |------|--------|
 | Probes | `GET /healthz`, `GET /readyz` (no auth) |
+| Metrics | `GET /metrics` — Prometheus text, scope `read` |
 | Health / sensors / raw | `GET /api/v1/health`, `/sensors`, `/rflink/raw` |
-| Command | `POST /api/v1/command` — same validation as MQTT |
+| Command | `POST /api/v1/command` — same validation as MQTT; audit log records source, actor, status |
+| HA purge | `POST /api/v1/ha/purge` — scope `command`; clears discovery topics this process still remembers |
 | Live raw | WebSocket `/api/v1/rflink/raw/ws` |
 | GUI auth | `HTTP_AUTH_TOKEN` → session cookie (72h); no token → GUI locked |
 | API auth | `API_AUTH_TOKEN` or GUI-created tokens; scopes `read` / `command` / `admin` |
@@ -177,6 +217,7 @@ Run from GHCR:
 
 ```bash
 # named volume keeps runtime.json / backups across restarts
+# TZ is an IANA zone. Etc/UTC matches the image default; tzdata is installed.
 docker volume create go-rflink-data
 
 docker run --name go-rflink --restart unless-stopped \
@@ -189,6 +230,7 @@ docker run --name go-rflink --restart unless-stopped \
   -e HTTP_LISTEN=0.0.0.0:8080 \
   -e HTTP_AUTH_TOKEN='use-a-long-random-secret-16+' \
   -e RUNTIME_CONFIG_FILE=/app/data/runtime.json \
+  -e TZ=Etc/UTC \
   -p 127.0.0.1:8080:8080 \
   -v go-rflink-data:/app/data \
   ghcr.io/merkat0r/go-rflink:latest
@@ -213,6 +255,9 @@ services:
       - go-rflink-data:/app/data
     environment:
       SERIAL_DEVICE: /dev/ttyACM0
+      # SERIAL_DEVICES: tcp://192.168.1.21:9999
+      # PUBLISH_TLS_CERT_FILE: /certs/client.crt
+      # PUBLISH_TLS_KEY_FILE: /certs/client.key
       PUBLISH_HOST: 192.168.0.1:1883
       PUBLISH_MQTT_USERNAME: gorflink
       PUBLISH_MQTT_PASSWORD: super-strong-mqtt-password
@@ -220,6 +265,7 @@ services:
       HTTP_LISTEN: "0.0.0.0:8080"
       HTTP_AUTH_TOKEN: use-a-long-random-secret-16+
       RUNTIME_CONFIG_FILE: /app/data/runtime.json
+      TZ: ${TZ:-Etc/UTC}             # IANA zone; the image includes tzdata and defaults to Etc/UTC
     healthcheck:                   # optional: HEALTHCHECK when HTTP is enabled (override if Listen differs)
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
       interval: 30s
@@ -238,7 +284,7 @@ docker compose -f docker-compose.ghcr.yml up -d
 
 ```bash
 docker build \
-  --build-arg VERSION=dev \
+  --build-arg VERSION=0.4.0 \
   --build-arg GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)" \
   -t go-rflink:local \
   -f Dockerfile \
@@ -276,6 +322,13 @@ docker compose logs -f go-rflink
 
 Also see [`deploy/mosquitto/mosquitto.conf`](deploy/mosquitto/mosquitto.conf).
 
+<a id="templates"></a>
+
+### Templates
+
+- Home Assistant add-on: [`deploy/homeassistant`](deploy/homeassistant). The badge in the header opens this git repository in the app store. [`repository.yaml`](repository.yaml) names it, and the Supervisor finds the add-on in that folder.
+- Unraid template: [`deploy/unraid/go-rflink.xml`](deploy/unraid/go-rflink.xml). Unraid has no one-click redirect. The badge is the template itself. Copy it to `/boot/config/plugins/dockerMan/templates-user/my-go-rflink.xml` on the flash drive, then Docker → Add Container and choose that template. Set `TZ` there.
+
 ## Configuration
 
 Full sample: [`env.sh.example`](env.sh.example). Only override what you need.
@@ -286,6 +339,8 @@ Full sample: [`env.sh.example`](env.sh.example). Only override what you need.
 |----------|---------|-------------|
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
 | `GORFLINK_DEBUG` | `false` | Force debug log level for tests |
+
+<a id="mqtt-publish"></a>
 
 ### MQTT publish
 
@@ -306,6 +361,8 @@ Full sample: [`env.sh.example`](env.sh.example). Only override what you need.
 | `PUBLISH_INFINITY_RECONNECT` | `true` | Background reconnect |
 | `PUBLISH_CONNECT_RETRY_INTERVAL` | `5` | Reconnect backoff base (seconds) |
 | `PUBLISH_TLS_CA_FILE` | | CA certificate path |
+| `PUBLISH_TLS_CERT_FILE` | | Client certificate for MQTT mTLS (TLS schemes only, with the key) |
+| `PUBLISH_TLS_KEY_FILE` | | Client private key for MQTT mTLS |
 | `PUBLISH_TLS_INSECURE_SKIP_VERIFY` | `false` | Skip TLS verify (warned) |
 | `PUBLISH_LWT_*` | | Optional custom LWT (default: `{topic}/status` offline) |
 | `PUBLISH_TEMPERATURE_UNIT` | `C` | `C`, `F`, or `RAW` |
@@ -313,6 +370,8 @@ Full sample: [`env.sh.example`](env.sh.example). Only override what you need.
 | `PUBLISH_HWID_MAP` | | `ID:CanonicalHWID,...` |
 | `PUBLISH_IGNORE_LIST` | `Keeloq` | Comma-separated model/HWID/ID to drop |
 | `PUBLISH_DEDUP_WINDOW_MS` | `3000` | Debounce window (`0` = off) |
+| `PUBLISH_MIN_INTERVAL_MS` | `0` | Minimum gap between publishes of one HWID (`0` = off) |
+| `PUBLISH_THROTTLE` | | Per-HWID override, `HWID:milliseconds,…` |
 | `PUBLISH_PENDING_TTL_SEC` | `60` | Latest-state buffer while MQTT down |
 | `PUBLISH_HEALTH_LOG_INTERVAL_SEC` | `300` | Health log/publish interval (`0` = off) |
 | `PUBLISH_COMMAND_WHITELIST` | | Allowed prefixes, e.g. `10;,11;` (empty = all) |
@@ -321,21 +380,30 @@ Full sample: [`env.sh.example`](env.sh.example). Only override what you need.
 | `PUBLISH_HOME_ASSISTANT_DISCOVERY` | `false` | Enable HA discovery |
 | `PUBLISH_HA_DISCOVERY_PREFIX` | `homeassistant` | HA discovery prefix |
 | `PUBLISH_HA_BUTTONS` | | `Label:10;cmd;,Label2:10;cmd2;` |
-| `PUBLISH_HA_SWITCHES` | | `Label:on_cmd:off_cmd,...` |
+| `PUBLISH_HA_SWITCHES` | | `Label:on_cmd:off_cmd,...`. Switches stay optimistic and also listen for an RX echo on `{topic}/gateway/switch/gorflink_sw_N/state` |
+| `PUBLISH_HA_DEVICE_TRIGGERS` | `true` | `device_automation` trigger beside each momentary `sw_*` binary sensor |
+| `PUBLISH_HA_SENSOR_AVAILABILITY` | `false` | Add `{topic}/{HWID}/availability`. Existing entities stay on global status until this is turned on and discovery is republished |
+| `PUBLISH_HA_SENSOR_STALE_SEC` | `0` | Publish `offline` on that topic after this much silence (`0` = never) |
+
+<a id="serial"></a>
 
 ### Serial
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SERIAL_DEVICE` | `/dev/ttyUSB0` | Serial device path |
+| `SERIAL_DEVICE` | `/dev/ttyUSB0` | Primary gateway. A serial path, or `tcp://host:port` / `net://host:port` for a networked RFLink (ESP32). A networked primary connects in the background |
+| `SERIAL_DEVICES` | | Extra gateways, comma-separated. Each gateway has its own 64-line queue, so a noisy port drops only its own lines. Health lists the queue fill (`queued`/`queue_cap`), drops, and the firmware version per port. With more than one port, `rflink/serial/status` is `online` only when every port is up, and each port also publishes `rflink/serial/<name>/status`. Home Assistant sensors use that per-port topic. One port keeps the single topic |
+| `SERIAL_COMMAND_DEVICES` | | Gateways that receive commands, comma-separated. Empty sends to every connected port. The GUI can store the same list in `runtime.json` |
 | `SERIAL_BAUD` | `57600` | Baud rate |
 | `SERIAL_READ_TIMEOUT_SEC` | `10` | Read timeout |
 | `SERIAL_RECONNECT_MIN_DELAY_SEC` | `3` | Min reconnect delay |
 | `SERIAL_RECONNECT_MAX_DELAY_SEC` | `60` | Max reconnect delay |
-| `SERIAL_WATCHDOG_SEC` | `120` | Warn if no serial data (`0` = off) |
-| `SERIAL_PING_INTERVAL_SEC` | `60` | `10;PING;` interval (`0` = off) |
+| `SERIAL_WATCHDOG_SEC` | `120` | Reopen a gateway that has been silent this long. Other gateways stay up (`0` = off) |
+| `SERIAL_PING_INTERVAL_SEC` | `60` | `10;PING;` interval on every connected gateway (`0` = off). A gateway that misses the threshold is reopened on its own |
 | `SERIAL_PING_TIMEOUT_SEC` | `5` | PONG wait timeout |
 | `SERIAL_PING_FAIL_THRESHOLD` | `3` | Failures before `rflink_unresponsive` |
+
+<a id="runtime"></a>
 
 ### HTTP / runtime / webhooks
 
@@ -353,6 +421,11 @@ Full sample: [`env.sh.example`](env.sh.example). Only override what you need.
 | `API_AUTH_TOKEN` | | `name:TOKEN[:expire[:scopes]],…` |
 | `API_TOKEN_PEPPER` | | Optional pepper for token hashes |
 | `WEBHOOKS_JSON` | | JSON array of outbound webhooks |
+| `GORFLINK_ENV_FILE` | `.env` | Optional env file. Already-set variables are kept |
+
+`GET /metrics` (read scope) exposes Prometheus counters and gauges: published, dropped, ping fails, MQTT and serial connected. `POST /api/v1/ha/purge` (command scope) clears discovery topics this process has published. Topics left by an older process are not in that cache; `scripts/purge-ha-discovery.sh` publishes an empty retained config for one topic you name.
+
+Commands are logged as `rflink command audit` with `source` (`http`, `mqtt`, `webhook`), `actor` (session prefix or token name), `status`, per-gateway `ports`, and time. `ok` means every selected gateway accepted the write. `partial` means at least one of them failed.
 
 See [`HTTP.md`](HTTP.md) for auth, scopes, routes, and webhook URL placeholders.
 
@@ -360,7 +433,7 @@ See [`HTTP.md`](HTTP.md) for auth, scopes, routes, and webhook URL placeholders.
 
 ```json
 {
-  "version": "1.2.3",
+  "version": "0.4.0",
   "git_sha": "abc1234",
   "started_at": "2026-08-08T12:00:00Z",
   "status": "online",
@@ -377,45 +450,52 @@ See [`HTTP.md`](HTTP.md) for auth, scopes, routes, and webhook URL placeholders.
 
 Also available via `GET /api/v1/health` when HTTP is enabled.
 
+<a id="tests"></a>
+
+## Tests
+
+CI runs `go test ./... -coverprofile=coverage.out` and prints `go tool cover -func`. The package tests use a fake serial port, a local TCP listener, and `httptest`. They do not open a COM port, a live MQTT broker, or the GUI in a browser.
+
 ## Roadmap / TODO
 
 Ideas for further development (not scheduled; PRs welcome).
 
 ### High value
 
-- [x] **HTTP API** — local control without MQTT only
-- [x] **Web GUI** — optional lightweight status UI (embedded)
-- [x] **HTTP API auth** — GUI sessions + scoped API tokens
-- [x] **Config overlay** — runtime.json + env merge, hot-reload, backups
-- [x] **Webhooks** — poll / push outbound hooks
-- [ ] **Per-sensor throttle** — min publish interval per HWID for chatty devices
-- [ ] **RTC Devices Card** — easy card (only GUI) with menu for pairing Rolling-Time-Codes devices
-- [ ] **Prometheus metrics** — `/metrics` (published, dropped, ping fails, connected gauges)
+- [x] **HTTP API** — local control without MQTT only. [HTTP API & Web GUI](#http-api)
+- [x] **Web GUI** — optional lightweight status UI (embedded). [HTTP API & Web GUI](#http-api)
+- [x] **HTTP API auth** — GUI sessions + scoped API tokens. [HTTP API & Web GUI](#http-api)
+- [x] **Config overlay** — runtime.json + env merge, hot-reload, backups. [HTTP / runtime / webhooks](#runtime)
+- [x] **Webhooks** — poll / push outbound hooks. [HTTP / runtime / webhooks](#runtime)
+- [x] **Per-sensor throttle** — min publish interval per HWID for chatty devices. [MQTT publish](#mqtt-publish)
+- [ ] **RTC Devices Card** — easy card (only GUI) with menu for pairing Rolling-Time-Codes devices (not available in default RFLink firmware, only on ESP32 Custom, so this waits until that support exists)
+- [x] **Prometheus metrics** — `/metrics` (published, dropped, ping fails, connected gauges). [HTTP API & Web GUI](#http-api)
 
 ### Home Assistant / devices
 
-- [ ] **Device triggers / events** for momentary RF buttons (alongside `off_delay` binary_sensors)
-- [ ] **HA switch state feedback** when RFLink echoes RX after TX
-- [ ] **Per-sensor availability** based on last-seen, not only global serial status
-- [ ] **Rediscover + purge** helper docs/script for stale HA entities
-- [ ] **HA App** template for direct run on HA
+- [x] **Device triggers / events** for momentary RF buttons (alongside `off_delay` binary_sensors). [Home Assistant](#home-assistant)
+- [x] **HA switch state feedback** when RFLink echoes RX after TX. [Home Assistant](#home-assistant)
+- [x] **Per-sensor availability** based on last-seen, not only global serial status. [Home Assistant](#home-assistant)
+- [x] **Rediscover + purge** helper docs/script for stale HA entities. [Home Assistant](#home-assistant)
+- [x] **HA App** template for direct run on HA. [Templates](#templates)
+
 ### Reliability & serial
 
-- [ ] **NET RFLink Devices** / support RFLink Devices that runs over network (ESP32 versions)
-- [ ] **Multiple serial ports** / multiple RFLink gateways in one process (maybe someday — not priority)
+- [x] **NET RFLink Devices** / support RFLink Devices that runs over network (ESP32 versions). [Serial](#serial)
+- [x] **Multiple serial ports** / multiple RFLink gateways. [Serial](#serial)
 
 ### Security & ops
 
-- [ ] **mTLS client certificates** for MQTT
-- [ ] **Structured audit log** of commands (who/when/result) beyond current session/token logs
+- [x] **mTLS client certificates** for MQTT. [TLS](#tls)
+- [x] **Structured audit log** of commands (who/when/result) beyond current session/token logs. [HTTP / runtime / webhooks](#runtime)
 
 ### Nice to have
 
-- [x] **Hot-reload** of ignore list / friendly names / related runtime keys
-- [ ] **Env file** (.env) optional .env loader if present for simplicity 
-- [x] **OpenSSF Scorecard** badge / workflow
-- [ ] **UnRaid** App template for unraid store
-- [ ] **Publish internal coverage + integration tests** (fake serial + mock MQTT)
+- [x] **Hot-reload** of ignore list / friendly names / related runtime keys. [HTTP / runtime / webhooks](#runtime)
+- [x] **Env file** (.env) optional .env loader if present for simplicity. [Quick best start](#quick-best-start)
+- [x] **OpenSSF Scorecard** badge / workflow. [Scorecard](#scorecard)
+- [x] **UnRaid** App template for unraid store. [Templates](#templates)
+- [x] **Publish internal coverage + integration tests** — CI prints `go test -coverprofile`; fake serial, TCP gateway, and HTTP tests are in `rflink`. A live MQTT broker is not started in CI. [Tests](#tests)
 ## Security
 
 Report vulnerabilities privately. See [SECURITY.md](SECURITY.md).

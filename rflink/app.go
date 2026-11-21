@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -18,7 +19,9 @@ type App struct {
 	opts      *Options
 	publisher *Publisher
 	serial    *SerialReader
-	serialCh  chan string
+	extras    []*SerialReader
+	ingress   *serialIngress
+	serialCh  chan serialFrame
 	ctx       context.Context
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
@@ -26,6 +29,8 @@ type App struct {
 	cmdMu       sync.Mutex
 	cmdTokens   float64
 	cmdLastFill time.Time
+	dropMu      sync.Mutex
+	dropWarned  map[string]bool
 
 	httpServer *httpAPIServer
 	runtime    *runtimeManager
@@ -88,8 +93,14 @@ func Init() (*App, error) {
 		return nil, fmt.Errorf("subscribe command topic: %w", err)
 	}
 
-	app.wg.Add(2)
+	app.ingress = newSerialIngress()
+	publisher.queues = app.ingress
+	app.wg.Add(3)
 	go app.runSerialLoop(ctx)
+	go func() {
+		defer app.wg.Done()
+		app.ingress.run(ctx, app.serialCh)
+	}()
 	go func() {
 		defer app.wg.Done()
 		publisher.RunPublishLoop(ctx, app.serialCh)
@@ -97,6 +108,12 @@ func Init() (*App, error) {
 	if opts.serialPingInterval() > 0 {
 		app.wg.Add(1)
 		go app.runPingLoop(ctx)
+	}
+	for _, dev := range opts.extraSerialDevices() {
+		sr := &SerialReader{opts: opts, device: dev}
+		app.extras = append(app.extras, sr)
+		app.wg.Add(1)
+		go app.runExtraSerial(ctx, sr)
 	}
 
 	log.Info("go-rflink started",
@@ -150,16 +167,33 @@ func Init() (*App, error) {
 }
 
 func (a *App) handleCommand(payload string) {
-	_ = a.ExecuteCommand(payload)
+	actor := ""
+	if a.opts != nil {
+		actor = a.opts.Publish.ClientID
+	}
+	_ = a.ExecuteCommandFrom(payload, "mqtt", actor)
 }
 
 // ExecuteCommand runs the same normalize / whitelist / rate-limit path as MQTT commands
 // and returns the outcome (also published to cmd/result when MQTT is up).
 func (a *App) ExecuteCommand(payload string) CmdResult {
+	return a.ExecuteCommandFrom(payload, "internal", "")
+}
+
+// ExecuteCommandFrom is ExecuteCommand plus the audit source and actor.
+// actor is a session prefix or token name, never the secret itself.
+func (a *App) ExecuteCommandFrom(payload, source, actor string) CmdResult {
+	return a.executeCommand(payload, source, actor, nil)
+}
+
+// executeCommand sends a command. A nil device list uses SERIAL_COMMAND_DEVICES,
+// which is every connected port when that list is empty. A non-nil list is the
+// one-shot target set for this call.
+func (a *App) executeCommand(payload, source, actor string, devices []string) CmdResult {
 	ctx := context.Background()
 	now := time.Now().Format(time.RFC3339Nano)
 	if a.ctx != nil && a.ctx.Err() != nil {
-		log.Info("rflink command skipped, shutting down", "command", payload)
+		log.Info("rflink command audit", "source", source, "actor", actor, "command", payload, "status", "stopping", "at", now)
 		return CmdResult{Command: payload, Status: "stopping", Error: "shutting down", ReceivedAt: now}
 	}
 
@@ -168,6 +202,7 @@ func (a *App) ExecuteCommand(payload string) CmdResult {
 		a.publisher.IncCommandRejected()
 		log.Warn("rflink command rejected by normalization", "command", payload, "err", err)
 		res := CmdResult{Command: payload, Status: "rejected", Error: err.Error(), ReceivedAt: now}
+		a.auditCommand(source, actor, res)
 		a.publisher.PublishCmdResult(ctx, res)
 		return res
 	}
@@ -176,6 +211,7 @@ func (a *App) ExecuteCommand(payload string) CmdResult {
 		a.publisher.IncCommandRejected()
 		log.Warn("rflink command rejected by whitelist", "command", cmd)
 		res := CmdResult{Command: cmd, Status: "rejected", ReceivedAt: now}
+		a.auditCommand(source, actor, res)
 		a.publisher.PublishCmdResult(ctx, res)
 		return res
 	}
@@ -186,27 +222,214 @@ func (a *App) ExecuteCommand(payload string) CmdResult {
 		log.Warn("rflink command rate-limited", "command", payload)
 		lim, rem, _ := a.CommandRateStatus()
 		res := CmdResult{Command: payload, Status: "rate_limited", ReceivedAt: now, RateLimitRemaining: rem, RateLimitPerSec: lim}
+		a.auditCommand(source, actor, res)
 		a.publisher.PublishCmdResult(ctx, res)
 		return res
 	}
 
-	if err := a.serial.Write(payload); err != nil {
+	ports, err := a.writeCommandTo(payload, devices)
+	if err != nil {
+		if errors.Is(err, errPartialCommand) {
+			log.Warn("rflink command partially sent", "command", payload, "ports", portAudit(ports))
+			res := CmdResult{Command: payload, Status: "partial", Error: err.Error(), ReceivedAt: now, Ports: ports}
+			a.auditCommand(source, actor, res)
+			a.publisher.PublishCmdResult(ctx, res)
+			return res
+		}
+		if errors.Is(err, errNoCommandTarget) {
+			log.Warn("rflink command skipped, no matching gateway", "command", payload, "err", err)
+			res := CmdResult{Command: payload, Status: "rejected", Error: err.Error(), ReceivedAt: now, Ports: ports}
+			a.auditCommand(source, actor, res)
+			a.publisher.PublishCmdResult(ctx, res)
+			return res
+		}
 		if errors.Is(err, errSerialNotConnected) {
 			log.Warn("rflink command skipped, serial not connected", "command", payload)
-			res := CmdResult{Command: payload, Status: "serial_down", Error: err.Error(), ReceivedAt: now}
+			res := CmdResult{Command: payload, Status: "serial_down", Error: err.Error(), ReceivedAt: now, Ports: ports}
+			a.auditCommand(source, actor, res)
 			a.publisher.PublishCmdResult(ctx, res)
 			return res
 		}
 		log.Error("failed to send rflink command", "command", payload, "err", err)
-		res := CmdResult{Command: payload, Status: "error", Error: err.Error(), ReceivedAt: now}
+		res := CmdResult{Command: payload, Status: "error", Error: err.Error(), ReceivedAt: now, Ports: ports}
+		a.auditCommand(source, actor, res)
 		a.publisher.PublishCmdResult(ctx, res)
 		return res
 	}
-	log.Info("rflink command sent", "command", payload)
+	log.Info("rflink command sent", "command", payload, "ports", portAudit(ports))
 	lim, rem, _ := a.CommandRateStatus()
-	res := CmdResult{Command: payload, Status: "ok", ReceivedAt: now, RateLimitRemaining: rem, RateLimitPerSec: lim}
+	res := CmdResult{Command: payload, Status: "ok", ReceivedAt: now, RateLimitRemaining: rem, RateLimitPerSec: lim, Ports: ports}
+	a.auditCommand(source, actor, res)
 	a.publisher.PublishCmdResult(ctx, res)
 	return res
+}
+
+func (a *App) auditCommand(source, actor string, res CmdResult) {
+	log.Info("rflink command audit",
+		"source", source,
+		"actor", actor,
+		"command", res.Command,
+		"status", res.Status,
+		"ports", portAudit(res.Ports),
+		"at", res.ReceivedAt,
+	)
+}
+
+func portAudit(ports []PortWrite) string {
+	if len(ports) == 0 {
+		return ""
+	}
+	parts := make([]string, len(ports))
+	for i, port := range ports {
+		if port.Error != "" {
+			parts[i] = port.Device + "=" + port.Status + "(" + port.Error + ")"
+			continue
+		}
+		parts[i] = port.Device + "=" + port.Status
+	}
+	return strings.Join(parts, ",")
+}
+
+// writeCommandTo sends a command to the selected gateways.
+// A nil device list uses SERIAL_COMMAND_DEVICES, which is every connected port
+// when that list is empty. The result is ok only when every matched gateway accepts the write.
+func (a *App) writeCommandTo(payload string, devices []string) ([]PortWrite, error) {
+	allow := func(name string) bool {
+		if devices == nil {
+			return a.opts.commandDeviceAllow(name)
+		}
+		for _, item := range devices {
+			if strings.EqualFold(strings.TrimSpace(item), strings.TrimSpace(name)) {
+				return true
+			}
+		}
+		return false
+	}
+	readers := make([]*SerialReader, 0, 1+len(a.extras))
+	if a.serial != nil {
+		readers = append(readers, a.serial)
+	}
+	readers = append(readers, a.extras...)
+	var first, failedWrite error
+	wrote := 0
+	failed := 0
+	matched := false
+	ports := make([]PortWrite, 0, len(readers))
+	for _, sr := range readers {
+		if sr == nil {
+			continue
+		}
+		name := sr.deviceName()
+		// An empty SERIAL_DEVICE still owns a reader that never opens.
+		// It must not turn a successful write on a real gateway into a partial result.
+		if name == "" && !sr.IsConnected() {
+			continue
+		}
+		if !allow(name) {
+			continue
+		}
+		matched = true
+		if err := sr.Write(payload); err != nil {
+			failed++
+			if first == nil {
+				first = err
+			}
+			// A later gateway that actually failed the write must not be reported
+			// as "serial not connected" just because an earlier port was closed.
+			if failedWrite == nil && !errors.Is(err, errSerialNotConnected) {
+				failedWrite = err
+			}
+			ports = append(ports, PortWrite{Device: name, Status: "error", Error: err.Error()})
+			if sr != a.serial {
+				log.Warn("extra serial command failed", "device", name, "err", err)
+			}
+			continue
+		}
+		wrote++
+		ports = append(ports, PortWrite{Device: name, Status: "ok"})
+	}
+	if wrote > 0 && failed > 0 {
+		return ports, errPartialCommand
+	}
+	if wrote > 0 {
+		return ports, nil
+	}
+	if !matched && (devices != nil || a.opts.commandDevicesConfigured()) {
+		return ports, errNoCommandTarget
+	}
+	if failedWrite != nil {
+		return ports, failedWrite
+	}
+	if first != nil {
+		return ports, first
+	}
+	return ports, errSerialNotConnected
+}
+
+// enqueueSerial parks a line on that gateway's queue. Without an ingress
+// (tests) it uses the shared channel. A full queue drops only that gateway.
+func (a *App) enqueueSerial(frame serialFrame) bool {
+	if a == nil {
+		return false
+	}
+	ok := false
+	if a.ingress != nil {
+		ok = a.ingress.offer(frame)
+	} else if a.serialCh != nil {
+		select {
+		case a.serialCh <- frame:
+			ok = true
+		default:
+		}
+	}
+	if ok {
+		a.clearSerialDropWarn(frame.Device)
+	}
+	return ok
+}
+
+// noteSerialQueueFull counts a discarded line and warns once per gateway
+// until that queue accepts a line again.
+func (a *App) noteSerialQueueFull(device string) {
+	if a == nil {
+		return
+	}
+	if a.publisher != nil {
+		a.publisher.IncPortDropped(device)
+	}
+	if a.serialDropWarned(device) {
+		return
+	}
+	log.Warn("serial queue full, discarding further lines until the queue drains", "device", device)
+}
+
+func (a *App) serialDropWarned(device string) bool {
+	a.dropMu.Lock()
+	defer a.dropMu.Unlock()
+	if a.dropWarned == nil {
+		a.dropWarned = map[string]bool{}
+	}
+	if a.dropWarned[device] {
+		return true
+	}
+	a.dropWarned[device] = true
+	return false
+}
+
+func (a *App) clearSerialDropWarn(device string) {
+	if a == nil {
+		return
+	}
+	a.dropMu.Lock()
+	delete(a.dropWarned, device)
+	a.dropMu.Unlock()
+}
+
+func (a *App) noteSerial(ctx context.Context, device string, up bool) {
+	if a == nil || a.publisher == nil {
+		return
+	}
+	a.publisher.SetDeviceConnected(ctx, device, up)
 }
 
 func (a *App) allowCommand() bool {
@@ -226,7 +449,14 @@ func (a *App) allowCommand() bool {
 
 func (a *App) refillCmdTokensLocked(now time.Time, limit int) {
 	elapsed := now.Sub(a.cmdLastFill).Seconds()
+	// A step backwards (NTP, manual clock) must not drive the bucket negative.
+	if elapsed < 0 {
+		elapsed = 0
+	}
 	a.cmdLastFill = now
+	if a.cmdTokens < 0 {
+		a.cmdTokens = 0
+	}
 	a.cmdTokens += elapsed * float64(limit)
 	if a.cmdTokens > float64(limit) {
 		a.cmdTokens = float64(limit)
@@ -247,6 +477,9 @@ func (a *App) CommandRateStatus() (limit int, remaining float64, unlimited bool)
 
 func (a *App) runSerialLoop(ctx context.Context) {
 	defer a.wg.Done()
+	if a.serial == nil || strings.TrimSpace(a.serial.deviceName()) == "" {
+		return
+	}
 
 	minDelay := a.opts.serialReconnectMinDelay()
 	maxDelay := a.opts.serialReconnectMaxDelay()
@@ -278,9 +511,7 @@ func (a *App) runSerialSession(
 		log.Error("serial session panic recovered", "panic", recovered)
 		if a.serial != nil {
 			a.serial.disconnect()
-		}
-		if a.publisher != nil {
-			a.publisher.SetSerialConnected(ctx, false)
+			a.noteSerial(ctx, a.serial.deviceName(), false)
 		}
 		// Back off. Returning immediately would tight-loop a repeating panic.
 		if !sleepContext(ctx, *reconnectDelay) {
@@ -312,7 +543,7 @@ func (a *App) runSerialSession(
 				"err", err,
 				"retry_in", *reconnectDelay,
 			)
-			a.publisher.SetSerialConnected(ctx, false)
+			a.noteSerial(ctx, a.serial.deviceName(), false)
 			if !sleepContext(ctx, *reconnectDelay) {
 				return false
 			}
@@ -327,18 +558,14 @@ func (a *App) runSerialSession(
 	}
 
 	// Always publish serial online when the port is open (including initial open from NewSerialReader).
-	if a.serial.IsConnected() {
-		a.publisher.SetSerialConnected(ctx, true)
-		if err := a.serial.Write("10;version;"); err != nil {
-			log.Warn("failed to request rflink version", "err", err)
-		}
-	}
-
 	sessionCtx, sessionCancel := context.WithCancel(ctx)
 	defer sessionCancel()
 	if a.publisher != nil && a.publisher.serialRestart != nil {
+		// Drop a signal left by the previous session, then listen before
+		// noteSerial. That publish can block for the MQTT write budget, and a
+		// ping timeout in that window must still cancel this session. Draining
+		// afterwards used to throw the only restart signal away.
 		a.publisher.DrainSerialRestart()
-		a.publisher.ResetPingState()
 		restart := a.publisher.serialRestart
 		go func() {
 			select {
@@ -349,27 +576,49 @@ func (a *App) runSerialSession(
 			}
 		}()
 	}
+	if a.serial.IsConnected() {
+		if a.publisher != nil {
+			// Drop a PING from the previous session before status is published.
+			// noteSerial can block in MQTT, and the ping loop can write 10;PING;
+			// in that window. Resetting afterwards forgets that write: MarkPingWritten
+			// only stamps a timestamp that is still set.
+			a.publisher.ResetPingState()
+		}
+		a.noteSerial(ctx, a.serial.deviceName(), true)
+		if sessionCtx.Err() == nil {
+			if err := a.serial.Write("10;version;"); err != nil {
+				log.Warn("failed to request rflink version", "device", a.serial.deviceName(), "err", err)
+			}
+		}
+	}
 
 	sessionStart := time.Now()
 	err := a.serial.ReadLines(sessionCtx, func(line string) error {
 		log.Debug("serial raw message", "message", line)
-		a.publisher.NoteSerialActivity()
+		a.publisher.NoteSerialActivityFrom(a.serial.deviceName())
 		// PONG must be counted even when the publish queue is full.
-		if info, perr := ParseGatewayMessage(line); perr == nil && info != nil && info.Pong {
-			a.publisher.NotePong()
+		if info, perr := ParseGatewayMessage(line); perr == nil && info != nil {
+			if info.Pong {
+				a.publisher.NotePong()
+			}
+			// The queue may drop the line. The firmware still has to be kept
+			// for the next retained PONG.
+			if info.Version != "" {
+				a.publisher.noteGatewayVersion(a.serial.deviceName(), info.Version)
+			}
 		}
 
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return ctx.Err()
-		case a.serialCh <- line:
-			return nil
-		default:
-			a.publisher.IncSerialDropped()
-			log.Warn("serial channel full, discarding message", "message", line)
+		}
+		frame := serialFrame{Device: a.serial.deviceName(), Line: line}
+		if a.enqueueSerial(frame) {
 			return nil
 		}
+		a.noteSerialQueueFull(frame.Device)
+		return nil
 	})
+	sessionUp := time.Since(sessionStart)
 
 	if ctx.Err() != nil {
 		return false
@@ -378,7 +627,7 @@ func (a *App) runSerialSession(
 	unresponsive := sessionCtx.Err() != nil
 	a.serial.PauseWrites()
 	if a.publisher != nil {
-		a.publisher.SetSerialConnected(ctx, false)
+		a.noteSerial(ctx, a.serial.deviceName(), false)
 		// A reopened port must collect a fresh run of missed PONGs.
 		a.publisher.ResetPingState()
 		a.publisher.DrainSerialRestart()
@@ -398,17 +647,22 @@ func (a *App) runSerialSession(
 
 	if cerr := a.serial.CloseIfIdle(serialCloseWait); cerr != nil {
 		log.Warn("serial close skipped, write still in the driver", "err", cerr, "retry_in", *reconnectDelay)
-		if !sleepContext(ctx, *reconnectDelay) {
-			return false
+		for {
+			if !sleepContext(ctx, *reconnectDelay) {
+				return false
+			}
+			*reconnectDelay = nextBackoff(*reconnectDelay, minDelay, maxDelay)
+			if cerr = a.serial.CloseIfIdle(serialCloseWait); cerr == nil {
+				break
+			}
+			log.Warn("serial close skipped, write still in the driver", "err", cerr, "retry_in", *reconnectDelay)
 		}
-		*reconnectDelay = nextBackoff(*reconnectDelay, minDelay, maxDelay)
-		return true
 	}
 	a.serial.ResumeWrites()
 
-	// A port that opens and then fails the read immediately must keep growing
-	// the delay. Reset only after a session that actually stayed up.
-	if minDelay > 0 && time.Since(sessionStart) >= minDelay {
+	// Reset only after a read that stayed up. Time spent waiting for a stuck
+	// write to leave the driver is not a live session.
+	if sessionLivedLongEnough(sessionUp, minDelay) {
 		*reconnectDelay = minDelay
 	}
 	if !sleepContext(ctx, *reconnectDelay) {
@@ -416,6 +670,115 @@ func (a *App) runSerialSession(
 	}
 	*reconnectDelay = nextBackoff(*reconnectDelay, minDelay, maxDelay)
 	return true
+}
+
+// runExtraSerial reads another gateway into the same publish queue.
+// Each port updates the shared serial status. With more than one port the
+// aggregate topic is online only when every configured port is up.
+func (a *App) runExtraSerial(ctx context.Context, sr *SerialReader) {
+	defer a.wg.Done()
+	minDelay := a.opts.serialReconnectMinDelay()
+	maxDelay := a.opts.serialReconnectMaxDelay()
+	delay := minDelay
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		if !sr.IsConnected() {
+			if err := sr.Reconnect(); err != nil {
+				log.Warn("extra serial reconnect failed", "device", sr.deviceName(), "err", err, "retry_in", delay)
+				a.noteSerial(ctx, sr.deviceName(), false)
+				if !sleepContext(ctx, delay) {
+					return
+				}
+				delay = nextBackoff(delay, minDelay, maxDelay)
+				continue
+			}
+			log.Info("extra serial connected", "device", sr.deviceName())
+		}
+		sessionCtx, sessionCancel := context.WithCancel(ctx)
+		if a.publisher != nil {
+			a.publisher.drainExtraRestart(sr.deviceName())
+			restart := a.publisher.extraRestartChan(sr.deviceName())
+			go func() {
+				select {
+				case <-ctx.Done():
+				case <-sessionCtx.Done():
+				case <-restart:
+					sessionCancel()
+				}
+			}()
+		}
+		if sr.IsConnected() {
+			if a.publisher != nil {
+				// Same order as the primary: clear the previous session before
+				// noteSerial, which can block while a new PING is written.
+				a.publisher.resetExtraPing(sr.deviceName())
+			}
+			a.noteSerial(ctx, sr.deviceName(), true)
+			if sessionCtx.Err() == nil {
+				if err := sr.Write("10;version;"); err != nil {
+					log.Warn("failed to request rflink version", "device", sr.deviceName(), "err", err)
+				}
+			}
+		}
+		sessionStart := time.Now()
+		err := sr.ReadLines(sessionCtx, func(line string) error {
+			if a.publisher != nil {
+				a.publisher.NoteSerialActivityFrom(sr.deviceName())
+			}
+			if info, perr := ParseGatewayMessage(line); perr == nil && info != nil && a.publisher != nil {
+				if info.Pong {
+					a.publisher.noteExtraPong(sr.deviceName())
+				}
+				if info.Version != "" {
+					a.publisher.noteGatewayVersion(sr.deviceName(), info.Version)
+				}
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			frame := serialFrame{Device: sr.deviceName(), Line: line}
+			if a.enqueueSerial(frame) {
+				return nil
+			}
+			a.noteSerialQueueFull(frame.Device)
+			return nil
+		})
+		sessionUp := time.Since(sessionStart)
+		sessionCancel()
+		if ctx.Err() != nil {
+			return
+		}
+		a.noteSerial(ctx, sr.deviceName(), false)
+		if a.publisher != nil {
+			a.publisher.drainExtraRestart(sr.deviceName())
+			a.publisher.resetExtraPing(sr.deviceName())
+		}
+		sr.PauseWrites()
+		if cerr := sr.CloseIfIdle(serialCloseWait); cerr != nil {
+			log.Warn("extra serial close skipped, write still in the driver", "device", sr.deviceName(), "err", cerr)
+			for {
+				if !sleepContext(ctx, delay) {
+					return
+				}
+				delay = nextBackoff(delay, minDelay, maxDelay)
+				if cerr = sr.CloseIfIdle(serialCloseWait); cerr == nil {
+					break
+				}
+				log.Warn("extra serial close skipped, write still in the driver", "device", sr.deviceName(), "err", cerr)
+			}
+		}
+		sr.ResumeWrites()
+		if sessionLivedLongEnough(sessionUp, minDelay) {
+			delay = minDelay
+		}
+		log.Warn("extra serial read ended, reconnecting", "device", sr.deviceName(), "err", err, "retry_in", delay)
+		if !sleepContext(ctx, delay) {
+			return
+		}
+		delay = nextBackoff(delay, minDelay, maxDelay)
+	}
 }
 
 // runPingLoop periodically sends 10;PING; to confirm RFLink firmware is alive.
@@ -455,30 +818,70 @@ func (a *App) runPingLoop(ctx context.Context) {
 }
 
 func (a *App) sendPing() {
-	if a.serial == nil || !a.serial.IsConnected() || !a.serial.WritesAllowed() {
+	readers := make([]*SerialReader, 0, 1+len(a.extras))
+	if a.serial != nil {
+		readers = append(readers, a.serial)
+	}
+	readers = append(readers, a.extras...)
+	for _, sr := range readers {
+		a.sendPingTo(sr, sr == a.serial)
+	}
+}
+
+func (a *App) sendPingTo(sr *SerialReader, primary bool) {
+	if sr == nil || !sr.IsConnected() || !sr.WritesAllowed() {
 		return
 	}
-	if a.publisher != nil && a.publisher.PingOutstanding() {
-		log.Debug("skipping PING, previous still outstanding")
-		return
+	name := sr.deviceName()
+	if a.publisher != nil {
+		if primary && a.publisher.PingOutstanding() {
+			log.Debug("skipping PING, previous still outstanding", "device", name)
+			return
+		}
+		if !primary && a.publisher.extraPingOutstanding(name) {
+			log.Debug("skipping PING, previous still outstanding", "device", name)
+			return
+		}
 	}
 	const cmd = "10;PING;"
 	// Mark before the write so a PONG already sitting in the driver buffer
-	// is not applied to a still-zero pingSentAt.
+	// is not applied to a still-zero ping timestamp.
 	if a.publisher != nil {
-		a.publisher.MarkPingSent()
-	}
-	if err := a.serial.Write(cmd); err != nil {
-		if a.publisher != nil {
-			a.publisher.ClearPingSent()
+		if primary {
+			a.publisher.MarkPingSent()
+		} else {
+			a.publisher.markExtraPing(name)
 		}
-		log.Warn("failed to send RFLink PING", "err", err)
+		defer func() {
+			if rec := recover(); rec != nil {
+				if primary {
+					a.publisher.abandonPingIfWriting()
+				} else {
+					a.publisher.abandonExtraPingIfWriting(name)
+				}
+				panic(rec)
+			}
+		}()
+	}
+	if err := sr.Write(cmd); err != nil {
+		if a.publisher != nil {
+			if primary {
+				a.publisher.ClearPingSent()
+			} else {
+				a.publisher.clearExtraPing(name)
+			}
+		}
+		log.Warn("failed to send RFLink PING", "device", name, "err", err)
 		return
 	}
 	if a.publisher != nil {
-		a.publisher.MarkPingWritten()
+		if primary {
+			a.publisher.MarkPingWritten()
+		} else {
+			a.publisher.markExtraPingWritten(name)
+		}
 	}
-	log.Debug("RFLink PING sent")
+	log.Debug("RFLink PING sent", "device", name)
 }
 
 // ShutdownGrace is how long main should wait for Stop. Serial reads block until
@@ -495,6 +898,14 @@ func (a *App) ShutdownGrace() time.Duration {
 
 // Stop gracefully shuts down background workers and closes connections.
 func (a *App) Stop() {
+	if a.serial != nil {
+		a.serial.PauseWrites()
+	}
+	for _, sr := range a.extras {
+		if sr != nil {
+			sr.PauseWrites()
+		}
+	}
 	a.cancel()
 	a.wg.Wait()
 
@@ -512,8 +923,16 @@ func (a *App) Stop() {
 		a.publisher.Disconnect()
 	}
 	if a.serial != nil {
-		if err := a.serial.Close(); err != nil {
-			log.Warn("failed to close serial port", "err", err)
+		if err := a.serial.CloseIfIdle(serialCloseWait); err != nil {
+			log.Warn("serial close skipped, write still in the driver", "err", err)
+		}
+	}
+	for _, sr := range a.extras {
+		if sr == nil {
+			continue
+		}
+		if err := sr.CloseIfIdle(serialCloseWait); err != nil {
+			log.Warn("serial close skipped, write still in the driver", "device", sr.deviceName(), "err", err)
 		}
 	}
 

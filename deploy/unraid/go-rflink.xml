@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>go-rflink</Name>
+  <Repository>ghcr.io/merkat0r/go-rflink:latest</Repository>
+  <Registry>https://github.com/MERKAT0R/go-RFLink</Registry>
+  <Network>bridge</Network>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/MERKAT0R/go-RFLink/issues</Support>
+  <TemplateURL>https://raw.githubusercontent.com/MERKAT0R/go-RFLink/master/deploy/unraid/go-rflink.xml</TemplateURL>
+  <Date>2026-11-21</Date>
+  <Project>https://github.com/MERKAT0R/go-RFLink</Project>
+  <Overview>RFLink UART or TCP gateway to MQTT, with an optional local web UI.</Overview>
+  <Category>HomeAutomation:</Category>
+  <WebUI>http://[IP]:[PORT:8080]/</WebUI>
+  <Config Name="Web UI" Target="8080" Default="8080" Mode="tcp" Description="HTTP API and GUI" Type="Port" Display="always" Required="false" Mask="false">8080</Config>
+  <Config Name="Serial device" Target="/dev/ttyACM0" Default="/dev/ttyACM0" Mode="" Description="Host UART passed through to the container. For a networked RFLink set SERIAL_DEVICE to tcp://host:port and leave this unused." Type="Device" Display="always" Required="false" Mask="false">/dev/ttyACM0</Config>
+  <Config Name="SERIAL_DEVICE" Target="SERIAL_DEVICE" Default="/dev/ttyACM0" Mode="" Description="Primary gateway inside the container, or tcp://host:port" Type="Variable" Display="always" Required="true" Mask="false">/dev/ttyACM0</Config>
+  <Config Name="SERIAL_DEVICES" Target="SERIAL_DEVICES" Default="" Mode="" Description="Extra gateways, comma-separated" Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="SERIAL_COMMAND_DEVICES" Target="SERIAL_COMMAND_DEVICES" Default="" Mode="" Description="Gateways that receive commands. Empty sends to every connected port" Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="PUBLISH_HOST" Target="PUBLISH_HOST" Default="localhost:1883" Mode="" Description="MQTT host:port" Type="Variable" Display="always" Required="true" Mask="false">localhost:1883</Config>
+  <Config Name="PUBLISH_MQTT_USERNAME" Target="PUBLISH_MQTT_USERNAME" Default="username" Mode="" Description="MQTT username" Type="Variable" Display="always" Required="false" Mask="false">username</Config>
+  <Config Name="PUBLISH_MQTT_PASSWORD" Target="PUBLISH_MQTT_PASSWORD" Default="" Mode="" Description="MQTT password" Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="HTTP_LISTEN" Target="HTTP_LISTEN" Default="0.0.0.0:8080" Mode="" Description="HTTP listen address" Type="Variable" Display="always" Required="false" Mask="false">0.0.0.0:8080</Config>
+  <Config Name="HTTP_AUTH_TOKEN" Target="HTTP_AUTH_TOKEN" Default="" Mode="" Description="GUI password" Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="TZ" Target="TZ" Default="Etc/UTC" Mode="" Description="IANA timezone for logs and timestamps, for example Europe/Amsterdam. The image includes tzdata." Type="Variable" Display="always" Required="false" Mask="false">Etc/UTC</Config>
+  <Config Name="Appdata" Target="/app/data" Default="/mnt/user/appdata/go-rflink" Mode="rw" Description="runtime.json and backups" Type="Path" Display="advanced" Required="false" Mask="false">/mnt/user/appdata/go-rflink</Config>
+</Container>

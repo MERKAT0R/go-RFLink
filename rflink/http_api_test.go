@@ -40,7 +40,8 @@ func newCoverageStack(t *testing.T) (*App, *httpAPIServer) {
 	opts.Serial.ReconnectMinDelaySec = 3
 	opts.Serial.ReconnectMaxDelaySec = 60
 	opts.RuntimeConfigFile = filepath.Join(dir, "runtime.json")
-	opts.apiTokens = parseAPIAuthTokens("reader:readtoken123456:never:read,cmd:cmdtoken12345678:never:command,admin:admintoken123456:never:admin", "")
+	opts.APIAuthTokens = "reader:readtoken123456:never:read,cmd:cmdtoken12345678:never:command,admin:admintoken123456:never:admin"
+	opts.apiTokens = parseAPIAuthTokens(opts.APIAuthTokens, "")
 	opts.ignoreSet = map[string]struct{}{"KEELOQ": {}}
 
 	rm, err := newRuntimeManager(opts)
@@ -69,7 +70,7 @@ func newCoverageStack(t *testing.T) (*App, *httpAPIServer) {
 		opts:        opts,
 		publisher:   pub,
 		serial:      &SerialReader{port: newFakeSerial(), opts: opts},
-		serialCh:    make(chan string, 4),
+		serialCh:    make(chan serialFrame, 4),
 		ctx:         ctx,
 		cancel:      cancel,
 		cmdTokens:   20,
@@ -266,6 +267,14 @@ func TestHTTPAPI(t *testing.T) {
 		if rr.Code != http.StatusForbidden {
 			t.Fatalf("readonly %d", rr.Code)
 		}
+		h.app.cancel()
+		rr = doReq(h, http.MethodPost, "/api/v1/command", `{"command":"10;PING;"}`, map[string]string{
+			"Authorization": "Bearer cmdtoken12345678",
+			"Content-Type":  "application/json",
+		}, nil)
+		if rr.Code != http.StatusServiceUnavailable || !strings.Contains(rr.Body.String(), `"status": "stopping"`) {
+			t.Fatalf("stopping %d %s", rr.Code, rr.Body.String())
+		}
 		rr = doReq(h, http.MethodGet, "/api/v1/rate_limit", "", map[string]string{"Authorization": "Bearer readtoken123456"}, nil)
 		if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"limit_per_sec"`) {
 			t.Fatalf("rate %s", rr.Body.String())
@@ -273,8 +282,8 @@ func TestHTTPAPI(t *testing.T) {
 	})
 
 	t.Run("sensors raw serial rediscover", func(t *testing.T) {
-		h.app.publisher.handleSerialMessage(context.Background(), "20;02;PONG;")
-		h.app.publisher.handleSerialMessage(context.Background(), "20;01;Oregon;ID=0001;TEMP=00c8;")
+		h.app.publisher.handleSerialMessage(context.Background(), "", "20;02;PONG;")
+		h.app.publisher.handleSerialMessage(context.Background(), "", "20;01;Oregon;ID=0001;TEMP=00c8;")
 		rr := doReq(h, http.MethodGet, "/api/v1/sensors?samples=1", "", nil, cookies)
 		if rr.Code != http.StatusOK {
 			t.Fatalf("sensors %d", rr.Code)

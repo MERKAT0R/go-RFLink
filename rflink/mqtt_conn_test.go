@@ -10,12 +10,16 @@ import (
 	"context"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/eclipse/paho.golang/autopaho"
+	"github.com/gorilla/websocket"
 )
 
 // gateConn blocks inside Write so a test can see whether a second write entered.
@@ -128,6 +132,39 @@ func TestMQTTStreamWriteDeadlineUnblocks(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("write did not return")
 	}
+}
+
+func TestMQTTWebsocketWriteDeadlineUnblocks(t *testing.T) {
+	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	hold := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		<-hold
+	}))
+	defer srv.Close()
+	defer close(hold)
+
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ws.Close() }()
+
+	client := &mqttWebsocket{Conn: ws, writeTimeout: 40 * time.Millisecond}
+	payload := bytes.Repeat([]byte("x"), 32*1024)
+	started := time.Now()
+	for time.Since(started) < 2*time.Second {
+		_, err = client.Write(payload)
+		if err != nil {
+			return
+		}
+	}
+	t.Fatal("websocket write did not time out")
 }
 
 func TestMQTTDialRejectsUnknownScheme(t *testing.T) {

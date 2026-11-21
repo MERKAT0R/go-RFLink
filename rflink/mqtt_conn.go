@@ -104,20 +104,31 @@ func (c *mqttStream) Write(p []byte) (int, error) {
 
 // mqttWebsocket is one MQTT packet per websocket binary message.
 // The write lock is the same sync.Locker paho uses, so PUBLISH and PINGREQ
-// cannot interleave. Write deadlines are not set here: a deadline on a
-// websocket is fatal for the connection even after it is cleared.
+// cannot interleave. Each write gets a deadline. Gorilla marks the connection
+// dead only when that deadline fires mid-frame; a write that finishes clears
+// the deadline so the next packet is not failed by a stale timer.
 type mqttWebsocket struct {
 	*websocket.Conn
-	reader io.Reader
-	readMu sync.Mutex
-	mu     sync.Mutex
+	reader       io.Reader
+	readMu       sync.Mutex
+	mu           sync.Mutex
+	writeTimeout time.Duration
 }
 
 func (c *mqttWebsocket) Lock()   { c.mu.Lock() }
 func (c *mqttWebsocket) Unlock() { c.mu.Unlock() }
 
 func (c *mqttWebsocket) Write(p []byte) (int, error) {
-	if err := c.WriteMessage(websocket.BinaryMessage, p); err != nil {
+	timeout := c.writeTimeout
+	if timeout <= 0 {
+		timeout = mqttWriteTimeout
+	}
+	if err := c.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		return 0, err
+	}
+	err := c.WriteMessage(websocket.BinaryMessage, p)
+	_ = c.SetWriteDeadline(time.Time{})
+	if err != nil {
 		return 0, err
 	}
 	return len(p), nil
@@ -174,5 +185,5 @@ func dialMQTTWebsocket(ctx context.Context, tlsc *tls.Config, cfg autopaho.Clien
 	if err != nil {
 		return nil, fmt.Errorf("websocket connection failed: %w", err)
 	}
-	return &mqttWebsocket{Conn: ws}, nil
+	return &mqttWebsocket{Conn: ws, writeTimeout: mqttWriteTimeout}, nil
 }

@@ -84,8 +84,24 @@ type haDiscoveryPayload struct {
 }
 
 type haDiscovered struct {
-	component string
-	topic     string
+	component   string
+	topic       string
+	serialTopic string
+	deviceName  string
+	hwid        string // sanitized HWID this config was published for
+	origin      string // sanitized raw HWID, stable when the map renames it
+	epoch       uint64
+}
+
+// sameSensor reports whether this discovery config is already published.
+// The device name is part of the payload, so a rename must be published again.
+func (d haDiscovered) sameSensor(component, topic, serialTopic, deviceName string) bool {
+	return d.component == component && d.topic == topic && d.serialTopic == serialTopic && d.deviceName == deviceName
+}
+
+// sameTrigger reports whether this device-automation config is already published.
+func (d haDiscovered) sameTrigger(topic, deviceName string) bool {
+	return d.topic == topic && d.deviceName == deviceName
 }
 
 type haAvailability struct {
@@ -107,12 +123,23 @@ type haDeviceConfig struct {
 }
 
 func (p *Publisher) publishHomeAssistantDiscovery(ctx context.Context, sd *SensorData, fields map[string]string, prefix string) {
+	if hasSwitchButtonFields(fields) {
+		// FieldsForPublish omits cmd and switch once a channel button exists.
+		// Retire a config published by an earlier frame that had only one of them.
+		hwidSafe := sanitizeTopicSegment(sd.Hwid)
+		p.retireDiscovered(ctx, fmt.Sprintf("gorflink_%s_cmd", hwidSafe))
+		p.retireDiscovered(ctx, fmt.Sprintf("gorflink_%s_switch", hwidSafe))
+	}
 	for field, value := range fields {
 		if value == "" {
 			continue
 		}
 		// Skip raw switch id / cmd when we already publish per-button sw_XX entities.
+		// A previous frame may have discovered cmd or switch on its own. Clear
+		// that retained config so Home Assistant does not keep a stale entity.
 		if (field == "switch" || field == "cmd") && hasSwitchButtonFields(fields) {
+			hwidSafe := sanitizeTopicSegment(sd.Hwid)
+			p.retireDiscovered(ctx, fmt.Sprintf("gorflink_%s_%s", hwidSafe, sanitizeTopicSegment(field)))
 			continue
 		}
 		p.publishHomeAssistantEntity(ctx, sd, field, value, prefix)
@@ -197,36 +224,38 @@ func (p *Publisher) publishHomeAssistantEntity(ctx context.Context, sd *SensorDa
 		spec.component,
 		uniqueID,
 	)
-	retiredOld := false
-	if prev, loaded := p.discovered.Load(uniqueID); loaded {
-		old, _ := prev.(haDiscovered)
-		if old.component == spec.component && old.topic == discoveryTopic {
-			return
-		}
-		if old.topic != "" && old.topic != discoveryTopic {
-			if err := p.publishRaw(ctx, old.topic, "", p.opts.mqttQoS(), true); err != nil {
-				log.Error("home assistant discovery retire failed", "topic", old.topic, "err", err)
-				return
-			}
-			retiredOld = true
-		}
+	topicID := sd.TopicID()
+	avail := p.sensorAvailability(topicID)
+	serialTopic := ""
+	if len(avail) > 1 {
+		serialTopic = avail[1].Topic
 	}
-
 	deviceName := sd.FriendlyName
 	if deviceName == "" {
 		// Fallback if applyFriendlyName was not called
 		deviceName = fmt.Sprintf("goRFLink_%s %s", sd.Model, sd.Id)
 	}
+	var oldTopic string
+	epoch := p.discoveryEpoch.Load()
+	if prev, loaded := p.discovered.Load(uniqueID); loaded {
+		old, _ := prev.(haDiscovered)
+		if old.epoch == epoch && old.sameSensor(spec.component, discoveryTopic, serialTopic, deviceName) {
+			p.retireRenamedDiscovery(ctx, sd, uniqueID)
+			p.publishMomentaryTrigger(ctx, sd, field, prefix, uniqueID, spec)
+			return
+		}
+		if old.topic != "" && old.topic != discoveryTopic {
+			oldTopic = old.topic
+		}
+	}
 
-	topicID := sd.TopicID()
 	sumTopic := p.sensorFieldTopic(topicID, sumJSONSubtopic)
 
-	// Both topics must be online. MQTT LWT covers a dead process; serial/status
-	// covers a dead radio while the broker session is still up.
-	avail := []haAvailability{
-		{Topic: p.opts.statusTopic(), PayloadAvailable: statusOnline, PayloadNotAvailable: statusOffline},
-		{Topic: p.opts.serialStatusTopic(), PayloadAvailable: statusOnline, PayloadNotAvailable: statusOffline},
-	}
+	// Both topics must be online. MQTT LWT covers a dead process. The serial
+	// topic is the one gateway when only one is configured. With several
+	// gateways it is the port that last owned this sensor, so a different
+	// board going down leaves this entity available.
+	// A third topic is added only when per-sensor availability is enabled.
 
 	// Entity name is ONLY the measurement/button name.
 	// Device block already carries the human device name — avoids HA name doubling.
@@ -283,18 +312,24 @@ func (p *Publisher) publishHomeAssistantEntity(ctx context.Context, sd *SensorDa
 	}
 
 	if err := p.publishRaw(ctx, discoveryTopic, payload, p.opts.mqttQoS(), true); err != nil {
-		if retiredOld {
-			// The previous config is already cleared. Drop the cache entry so
-			// the next frame publishes this topic again.
-			p.discovered.Delete(uniqueID)
-		}
+		// Leave the previous retained config and the cache entry. Clearing
+		// first would remove the entity when this publish fails and dedup
+		// then drops the repeat that would have created the new one.
 		log.Error("home assistant discovery publish failed",
 			"topic", discoveryTopic,
 			"err", err,
 		)
 		return
 	}
-	p.discovered.Store(uniqueID, haDiscovered{component: spec.component, topic: discoveryTopic})
+	if oldTopic != "" {
+		if err := p.publishRaw(ctx, oldTopic, "", p.opts.mqttQoS(), true); err != nil {
+			log.Error("home assistant discovery retire failed", "topic", oldTopic, "err", err)
+			return
+		}
+	}
+	p.discovered.Store(uniqueID, haDiscovered{component: spec.component, topic: discoveryTopic, serialTopic: serialTopic, deviceName: deviceName, hwid: hwidSafe, origin: discoveryOrigin(sd), epoch: epoch})
+	p.retireRenamedDiscovery(ctx, sd, uniqueID)
+	p.publishMomentaryTrigger(ctx, sd, field, prefix, uniqueID, spec)
 
 	log.Info("home assistant entity discovered",
 		"component", spec.component,
@@ -304,4 +339,147 @@ func (p *Publisher) publishHomeAssistantEntity(ctx context.Context, sd *SensorDa
 		"state_topic", payload.StateTopic,
 		"device", deviceName,
 	)
+}
+
+func (p *Publisher) sensorAvailability(topicID string) []haAvailability {
+	avail := []haAvailability{
+		{Topic: p.opts.statusTopic(), PayloadAvailable: statusOnline, PayloadNotAvailable: statusOffline},
+		{Topic: p.sensorSerialTopic(topicID), PayloadAvailable: statusOnline, PayloadNotAvailable: statusOffline},
+	}
+	if p.opts.Publish.HASensorAvailability && topicID != "" {
+		avail = append(avail, haAvailability{
+			Topic:               p.sensorFieldTopic(topicID, "availability"),
+			PayloadAvailable:    statusOnline,
+			PayloadNotAvailable: statusOffline,
+		})
+	}
+	return avail
+}
+
+// publishMomentaryTrigger adds a device_automation trigger next to an sw_* binary
+// sensor. The sensor unique_id and its discovery topic stay as they are.
+func (p *Publisher) publishMomentaryTrigger(ctx context.Context, sd *SensorData, field, prefix, uniqueID string, spec haEntitySpec) {
+	if p == nil || p.opts == nil {
+		return
+	}
+	trigID := uniqueID + "_press"
+	if !p.opts.Publish.HADeviceTriggers || spec.component != "binary_sensor" || spec.payloadOn != "ON" {
+		// A retained device trigger must not stay after triggers are turned off
+		// or after this field stops being an ON binary_sensor.
+		p.retireDiscovered(ctx, trigID)
+		return
+	}
+	topic := fmt.Sprintf("%s/device_automation/%s/config", prefix, trigID)
+	epoch := p.discoveryEpoch.Load()
+	var oldTopic string
+	if prev, loaded := p.discovered.Load(trigID); loaded {
+		if old, ok := prev.(haDiscovered); ok {
+			if old.epoch == epoch && old.sameTrigger(topic, sd.FriendlyName) {
+				return
+			}
+			if old.topic != "" && old.topic != topic {
+				oldTopic = old.topic
+			}
+		}
+	}
+	ch := strings.TrimPrefix(field, "sw_")
+	hwidSafe := sanitizeTopicSegment(sd.Hwid)
+	payload := map[string]any{
+		"automation_type": "trigger",
+		"type":            "button_short_press",
+		"subtype":         "button_" + strings.ToLower(ch),
+		"payload":         "ON",
+		"topic":           p.sensorFieldTopic(sd.TopicID(), field),
+		"device": map[string]any{
+			"identifiers":  []string{fmt.Sprintf("gorflink_%s", hwidSafe)},
+			"name":         sd.FriendlyName,
+			"manufacturer": "RFLink",
+			"model":        sd.Model,
+		},
+	}
+	if err := p.publishRaw(ctx, topic, payload, p.opts.mqttQoS(), true); err != nil {
+		log.Error("HA device trigger discovery failed", "topic", topic, "err", err)
+		return
+	}
+	if oldTopic != "" {
+		if err := p.publishRaw(ctx, oldTopic, "", p.opts.mqttQoS(), true); err != nil {
+			log.Error("HA device trigger retire failed", "topic", oldTopic, "err", err)
+			return
+		}
+	}
+	p.discovered.Store(trigID, haDiscovered{component: "device_automation", topic: topic, deviceName: sd.FriendlyName, hwid: hwidSafe, origin: discoveryOrigin(sd), epoch: epoch})
+	log.Info("HA device trigger discovered", "unique_id", trigID, "topic", topic)
+}
+
+// retireRenamedDiscovery drops cached configs for this sensor whose published
+// HWID is no longer the current one. The raw id stays the identity, so a later
+// map edit (Kitchen to Living, or clearing the map) still clears the old entity.
+func (p *Publisher) retireRenamedDiscovery(ctx context.Context, sd *SensorData, uniqueID string) {
+	if p == nil || sd == nil {
+		return
+	}
+	origin := discoveryOrigin(sd)
+	curSafe := sanitizeTopicSegment(sd.Hwid)
+	if origin == "" || curSafe == "" {
+		return
+	}
+	// Match the stored HWID, not a prefix of it. OREGON_0001_ROOM starts with
+	// OREGON_0001_, and a prefix scan would clear the new entity on the next field.
+	oldPrefix := "gorflink_" + origin + "_"
+	curPrefix := "gorflink_" + curSafe + "_"
+	var stale []string
+	p.discovered.Range(func(key, val any) bool {
+		id, ok := key.(string)
+		if !ok || id == uniqueID {
+			return true
+		}
+		if old, is := val.(haDiscovered); is {
+			if old.origin != "" {
+				if strings.EqualFold(old.origin, origin) && !strings.EqualFold(old.hwid, curSafe) {
+					stale = append(stale, id)
+				}
+				return true
+			}
+			if old.hwid != "" {
+				if strings.EqualFold(old.hwid, origin) && !strings.EqualFold(old.hwid, curSafe) {
+					stale = append(stale, id)
+				}
+				return true
+			}
+		}
+		if strings.HasPrefix(id, oldPrefix) && !strings.HasPrefix(id, curPrefix) {
+			stale = append(stale, id)
+		}
+		return true
+	})
+	for _, id := range stale {
+		p.retireDiscovered(ctx, id)
+	}
+}
+
+func discoveryOrigin(sd *SensorData) string {
+	if sd == nil {
+		return ""
+	}
+	if raw := sanitizeTopicSegment(sd.RawHWID); raw != "" {
+		return raw
+	}
+	return sanitizeTopicSegment(sd.Hwid)
+}
+
+func (p *Publisher) retireDiscovered(ctx context.Context, id string) {
+	prev, loaded := p.discovered.Load(id)
+	if !loaded {
+		return
+	}
+	old, ok := prev.(haDiscovered)
+	if !ok || old.topic == "" {
+		p.discovered.Delete(id)
+		return
+	}
+	if err := p.publishRaw(ctx, old.topic, "", p.opts.mqttQoS(), true); err != nil {
+		log.Error("home assistant discovery retire failed", "topic", old.topic, "err", err)
+		return
+	}
+	p.discovered.Delete(id)
 }

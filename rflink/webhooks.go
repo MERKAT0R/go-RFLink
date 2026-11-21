@@ -84,24 +84,12 @@ func newWebhookManager(app *App) *webhookManager {
 				if len(via) >= 3 {
 					return fmt.Errorf("too many redirects")
 				}
+				*req = *req.WithContext(withWebhookScheme(req.Context(), req.URL.Scheme))
 				if err := validateWebhookURL(req.URL.String()); err != nil {
 					return err
 				}
 				if len(via) > 0 && webhookRedirectStripsSecrets(via[0], req) {
-					ua := req.Header.Get("User-Agent")
-					accept := req.Header.Get("Accept")
-					req.Header = make(http.Header)
-					if ua != "" {
-						req.Header.Set("User-Agent", ua)
-					}
-					if accept != "" {
-						req.Header.Set("Accept", accept)
-					}
-					// 307/308 replay the body. Do not carry a POST payload onto
-					// another host or down from https to http.
-					req.Body = http.NoBody
-					req.GetBody = nil
-					req.ContentLength = 0
+					stripWebhookRedirect(req)
 				}
 				return nil
 			},
@@ -110,16 +98,54 @@ func newWebhookManager(app *App) *webhookManager {
 	return m
 }
 
-// webhookRedirectStripsSecrets reports a hop that must not keep custom
-// headers or a POST body: a different host, or https downgraded to http.
+const webhookUserAgent = "go-rflink-webhook/1.0"
+
+// stripWebhookRedirect drops headers and the body on a hop that must not see
+// secrets. User-Agent and Accept are replaced with this client's own values:
+// a webhook header of the same name would otherwise be copied onto the new host.
+func stripWebhookRedirect(req *http.Request) {
+	if req == nil {
+		return
+	}
+	req.Header = make(http.Header)
+	req.Header.Set("User-Agent", webhookUserAgent)
+	req.Body = http.NoBody
+	req.GetBody = nil
+	req.ContentLength = 0
+}
 func webhookRedirectStripsSecrets(from, to *http.Request) bool {
 	if from == nil || to == nil || from.URL == nil || to.URL == nil {
 		return true
 	}
-	if !strings.EqualFold(from.URL.Host, to.URL.Host) {
+	if !strings.EqualFold(from.URL.Hostname(), to.URL.Hostname()) {
 		return true
 	}
-	return strings.EqualFold(from.URL.Scheme, "https") && !strings.EqualFold(to.URL.Scheme, "https")
+	fromScheme := strings.ToLower(from.URL.Scheme)
+	toScheme := strings.ToLower(to.URL.Scheme)
+	if fromScheme == "https" && toScheme != "https" {
+		return true
+	}
+	if fromScheme == toScheme && webhookPort(from.URL) != webhookPort(to.URL) {
+		return true
+	}
+	return false
+}
+
+func webhookPort(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	if port := u.Port(); port != "" {
+		return port
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return "443"
+	case "http":
+		return "80"
+	default:
+		return ""
+	}
 }
 
 func (m *webhookManager) Start(parent context.Context) {
@@ -155,6 +181,24 @@ func (m *webhookManager) Reload() {
 	if cancel != nil {
 		cancel()
 	}
+
+	// Publish the new list before waiting. An in-flight poll keeps the copy
+	// it already started, but push must stop using a webhook that was removed
+	// or edited. Waiting first left the old list in place for the whole poll,
+	// including a serial write that does not return until the driver does.
+	m.reloadMu.Lock()
+	if m.stopped || gen != m.reloadGen {
+		m.reloadMu.Unlock()
+		return
+	}
+	m.app.opts.runtimeMu.RLock()
+	hooks := append([]RuntimeWebhook{}, m.app.opts.webhooks...)
+	m.app.opts.runtimeMu.RUnlock()
+	m.mu.Lock()
+	m.hooks = hooks
+	m.mu.Unlock()
+	m.reloadMu.Unlock()
+
 	m.wg.Wait()
 
 	m.reloadMu.Lock()
@@ -162,10 +206,6 @@ func (m *webhookManager) Reload() {
 	if m.stopped || gen != m.reloadGen {
 		return
 	}
-
-	m.app.opts.runtimeMu.RLock()
-	hooks := append([]RuntimeWebhook{}, m.app.opts.webhooks...)
-	m.app.opts.runtimeMu.RUnlock()
 
 	parent := context.Background()
 	if m.app.ctx != nil {
@@ -259,6 +299,7 @@ func (m *webhookManager) doPollOnce(ctx context.Context, h RuntimeWebhook, metho
 
 	reqCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
+	reqCtx = withWebhookScheme(reqCtx, urlScheme(h.URL))
 
 	if err := validateWebhookURL(h.URL); err != nil {
 		log.Warn("webhook poll skipped: bad url", "name", h.Name, "err", err)
@@ -278,7 +319,7 @@ func (m *webhookManager) doPollOnce(ctx context.Context, h RuntimeWebhook, metho
 		log.Warn("webhook poll request build failed", "name", h.Name, "err", err)
 		return
 	}
-	req.Header.Set("User-Agent", "go-rflink-webhook/1.0")
+	req.Header.Set("User-Agent", webhookUserAgent)
 	req.Header.Set("Accept", "text/plain, application/json;q=0.9, */*;q=0.1")
 	for k, v := range h.Headers {
 		if k != "" && v != "" {
@@ -321,7 +362,7 @@ func (m *webhookManager) doPollOnce(ctx context.Context, h RuntimeWebhook, metho
 		return
 	}
 
-	res := m.app.ExecuteCommand(text)
+	res := m.app.ExecuteCommandFrom(text, "webhook", h.Name)
 	if res.Status != "ok" {
 		log.Warn("webhook poll command not ok", "name", h.Name, "status", res.Status, "error", res.Error)
 	}
@@ -338,11 +379,15 @@ func (m *webhookManager) NotifyRaw(entry rawLineEntry) {
 	hooks := append([]RuntimeWebhook{}, m.hooks...)
 	m.mu.RUnlock()
 
-	payload, _ := json.Marshal(map[string]string{
+	body := map[string]string{
 		"type":    "raw",
 		"at":      entry.At,
 		"message": entry.Message,
-	})
+	}
+	if entry.Device != "" {
+		body["device"] = entry.Device
+	}
+	payload, _ := json.Marshal(body)
 	for _, h := range hooks {
 		if !h.Enabled || strings.ToLower(h.Kind) != "push" {
 			continue
@@ -461,12 +506,13 @@ func (m *webhookManager) doPush(h RuntimeWebhook, body []byte, contentType strin
 		log.Warn("webhook push blocked after resolve", "name", h.Name, "err", err)
 		return
 	}
+	ctx = withWebhookScheme(ctx, urlScheme(u))
 	req, err := http.NewRequestWithContext(ctx, method, u, rdr)
 	if err != nil {
 		log.Warn("webhook push build failed", "name", h.Name, "err", err)
 		return
 	}
-	req.Header.Set("User-Agent", "go-rflink-webhook/1.0")
+	req.Header.Set("User-Agent", webhookUserAgent)
 	if method != http.MethodGet {
 		req.Header.Set("Content-Type", contentType)
 	}
@@ -566,7 +612,6 @@ func expandWebhookGETURL(template, payloadKind string, body []byte) (string, err
 	if err != nil {
 		return "", err
 	}
-	q := u.Query()
 	key := "payload"
 	switch strings.ToLower(strings.TrimSpace(payloadKind)) {
 	case "raw":
@@ -574,9 +619,26 @@ func expandWebhookGETURL(template, payloadKind string, body []byte) (string, err
 	case "sumjson", "json":
 		key = "json"
 	}
-	q.Set(key, string(body))
-	u.RawQuery = q.Encode()
+	u.RawQuery = appendWebhookQuery(u.RawQuery, key, string(body))
 	return u.String(), nil
+}
+
+// appendWebhookQuery adds key=value. A query that url.ParseQuery rejects
+// (a semicolon, a broken escape) is kept as stored and the new pair is appended.
+// Rebuilding it through url.Values drops those parameters with no error.
+func appendWebhookQuery(rawQuery, key, value string) string {
+	extra := url.Values{}
+	extra.Set(key, value)
+	enc := extra.Encode()
+	if rawQuery == "" {
+		return enc
+	}
+	q, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return rawQuery + "&" + enc
+	}
+	q.Set(key, value)
+	return q.Encode()
 }
 
 // --- validation / SSRF ---
@@ -623,12 +685,8 @@ func validateWebhookURLLimit(raw string, maxLen int) error {
 		return fmt.Errorf("metadata address not allowed")
 	}
 	if ip := net.ParseIP(host); ip != nil {
-		if err := rejectDangerousIP(ip); err != nil {
+		if err := rejectResolvedIP(u.Scheme, ip); err != nil {
 			return err
-		}
-		if u.Scheme == "http" && !ip.IsPrivate() && !ip.IsLoopback() {
-			// loopback already rejected; public HTTP discouraged
-			return fmt.Errorf("http only allowed for private IP addresses (use https)")
 		}
 	} else if u.Scheme == "http" {
 		// Allow common LAN / lab TLDs without TLS; public hostnames need https.
@@ -658,6 +716,41 @@ func rejectDangerousIP(ip net.IP) error {
 	return nil
 }
 
+func rejectResolvedIP(scheme string, ip net.IP) error {
+	if err := rejectDangerousIP(ip); err != nil {
+		return err
+	}
+	if strings.EqualFold(scheme, "http") && !ip.IsPrivate() {
+		return fmt.Errorf("http only allowed for private IP addresses (use https)")
+	}
+	return nil
+}
+
+type webhookSchemeCtx struct{}
+
+func withWebhookScheme(ctx context.Context, scheme string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, webhookSchemeCtx{}, strings.ToLower(scheme))
+}
+
+func urlScheme(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u == nil {
+		return ""
+	}
+	return u.Scheme
+}
+
+func webhookSchemeFrom(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	scheme, _ := ctx.Value(webhookSchemeCtx{}).(string)
+	return scheme
+}
+
 func webhookTransport() *http.Transport {
 	base, ok := http.DefaultTransport.(*http.Transport)
 	if !ok || base == nil {
@@ -683,7 +776,7 @@ func webhookDialContext(ctx context.Context, network, addr string) (net.Conn, er
 	var last error
 	dialer := net.Dialer{Timeout: 10 * time.Second}
 	for _, ipa := range ips {
-		if err := rejectDangerousIP(ipa.IP); err != nil {
+		if err := rejectResolvedIP(webhookSchemeFrom(ctx), ipa.IP); err != nil {
 			last = err
 			continue
 		}
@@ -727,7 +820,7 @@ func validateWebhookURLResolvedLimit(ctx context.Context, raw string, maxLen int
 		return fmt.Errorf("missing hostname")
 	}
 	if ip := net.ParseIP(host); ip != nil {
-		return rejectDangerousIP(ip)
+		return rejectResolvedIP(u.Scheme, ip)
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -742,7 +835,7 @@ func validateWebhookURLResolvedLimit(ctx context.Context, raw string, maxLen int
 		return fmt.Errorf("dns lookup: no addresses")
 	}
 	for _, ipa := range addrs {
-		if err := rejectDangerousIP(ipa.IP); err != nil {
+		if err := rejectResolvedIP(u.Scheme, ipa.IP); err != nil {
 			return fmt.Errorf("resolved %s → %s: %w", host, ipa.IP, err)
 		}
 	}
@@ -858,25 +951,25 @@ func newWebhookID() string {
 	return fmt.Sprintf("id-%d-%d", time.Now().UnixNano(), n)
 }
 
-// stabilizeWebhookIDs fills empty ids, keeps an id already issued for the same
+// stabilizeWebhookIDs fills empty ids, keeps ids already issued for the same
 // name, and gives a duplicate id its own value so update/delete can address it.
+// Several hooks may share a name. Each one keeps the id from the same position
+// in the previous list, so a later reload does not mint a new id for the second hook.
 func stabilizeWebhookIDs(list, prev []RuntimeWebhook) []RuntimeWebhook {
-	byName := make(map[string]string, len(prev))
+	byName := make(map[string][]string, len(prev))
 	for _, h := range prev {
 		name := strings.ToLower(strings.TrimSpace(h.Name))
 		if name == "" || h.ID == "" {
 			continue
 		}
-		if _, ok := byName[name]; !ok {
-			byName[name] = h.ID
-		}
+		byName[name] = append(byName[name], h.ID)
 	}
 	used := make(map[string]struct{}, len(list))
 	for i := range list {
 		name := strings.ToLower(strings.TrimSpace(list[i].Name))
-		if id, ok := byName[name]; ok {
-			list[i].ID = id
-			delete(byName, name)
+		if ids := byName[name]; len(ids) > 0 {
+			list[i].ID = ids[0]
+			byName[name] = ids[1:]
 		}
 		if list[i].ID == "" {
 			list[i].ID = newWebhookID()
@@ -888,6 +981,18 @@ func stabilizeWebhookIDs(list, prev []RuntimeWebhook) []RuntimeWebhook {
 		used[list[i].ID] = struct{}{}
 	}
 	return list
+}
+
+func webhookIDsChanged(before, after []RuntimeWebhook) bool {
+	if len(before) != len(after) {
+		return true
+	}
+	for i := range before {
+		if before[i].ID != after[i].ID {
+			return true
+		}
+	}
+	return false
 }
 
 func parseWebhooksJSON(raw string) []RuntimeWebhook {
@@ -948,7 +1053,9 @@ func mergeWebhookUpdate(existing RuntimeWebhook, raw map[string]json.RawMessage,
 	}
 	if hdr, ok := raw["headers"]; ok {
 		trimmed := bytes.TrimSpace(hdr)
-		if len(trimmed) > 0 && string(trimmed) != "{}" && string(trimmed) != "null" {
+		// {} and null keep stored secrets. Pretty-printed "{ }" is the same
+		// empty object; only a non-empty object replaces the saved headers.
+		if len(trimmed) > 0 && string(trimmed) != "null" && !emptyJSONObject(trimmed) {
 			merged.Headers = incoming.Headers
 		}
 	}
@@ -958,6 +1065,19 @@ func mergeWebhookUpdate(existing RuntimeWebhook, raw map[string]json.RawMessage,
 		return RuntimeWebhook{}, fmt.Errorf("%w: %s", errWebhookInvalid, err.Error())
 	}
 	return merged, nil
+}
+
+// emptyJSONObject reports whether raw is a JSON object with no keys.
+// Invalid JSON returns false so the caller can replace headers as before.
+func emptyJSONObject(raw []byte) bool {
+	if len(raw) == 0 || raw[0] != '{' {
+		return false
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return false
+	}
+	return len(m) == 0
 }
 
 func webhooksPublicView(list []RuntimeWebhook) []map[string]any {

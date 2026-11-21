@@ -17,7 +17,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        VERSION: ${VERSION:-dev}
+        VERSION: ${VERSION:-0.4.0}
         GIT_SHA: ${GIT_SHA:-unknown}
     image: ${IMAGE:-go-rflink:local}
     container_name: go-rflink
@@ -40,6 +40,7 @@ services:
       # - ./certs/ca.crt:/certs/ca.crt:ro
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      TZ: ${TZ:-Etc/UTC}
       # MQTT
       PUBLISH_HOST: ${PUBLISH_HOST:-mosquitto:1883}
       PUBLISH_SCHEME: ${PUBLISH_SCHEME:-tcp}
@@ -55,10 +56,14 @@ services:
       PUBLISH_INFINITY_RECONNECT: ${PUBLISH_INFINITY_RECONNECT:-true}
       PUBLISH_CONNECT_RETRY_INTERVAL: ${PUBLISH_CONNECT_RETRY_INTERVAL:-5}
       PUBLISH_TLS_CA_FILE: ${PUBLISH_TLS_CA_FILE:-}
+      PUBLISH_TLS_CERT_FILE: ${PUBLISH_TLS_CERT_FILE:-}
+      PUBLISH_TLS_KEY_FILE: ${PUBLISH_TLS_KEY_FILE:-}
       PUBLISH_TLS_INSECURE_SKIP_VERIFY: ${PUBLISH_TLS_INSECURE_SKIP_VERIFY:-false}
       # Sensors / commands
       PUBLISH_TEMPERATURE_UNIT: ${PUBLISH_TEMPERATURE_UNIT:-C}
       PUBLISH_DEDUP_WINDOW_MS: ${PUBLISH_DEDUP_WINDOW_MS:-3000}
+      PUBLISH_MIN_INTERVAL_MS: ${PUBLISH_MIN_INTERVAL_MS:-0}
+      PUBLISH_THROTTLE: ${PUBLISH_THROTTLE:-}
       PUBLISH_PENDING_TTL_SEC: ${PUBLISH_PENDING_TTL_SEC:-60}
       PUBLISH_HEALTH_LOG_INTERVAL_SEC: ${PUBLISH_HEALTH_LOG_INTERVAL_SEC:-300}
       PUBLISH_FRIENDLY_NAMES: ${PUBLISH_FRIENDLY_NAMES:-}
@@ -72,8 +77,14 @@ services:
       PUBLISH_HA_DISCOVERY_PREFIX: ${PUBLISH_HA_DISCOVERY_PREFIX:-homeassistant}
       PUBLISH_HA_BUTTONS: ${PUBLISH_HA_BUTTONS:-}
       PUBLISH_HA_SWITCHES: ${PUBLISH_HA_SWITCHES:-}
-      # Serial (path inside container = host path when bind-mapped 1:1)
+      PUBLISH_HA_DEVICE_TRIGGERS: ${PUBLISH_HA_DEVICE_TRIGGERS:-true}
+      PUBLISH_HA_SENSOR_AVAILABILITY: ${PUBLISH_HA_SENSOR_AVAILABILITY:-false}
+      PUBLISH_HA_SENSOR_STALE_SEC: ${PUBLISH_HA_SENSOR_STALE_SEC:-0}
+      # Serial (path inside container = host path when bind-mapped 1:1).
+      # Networked RFLink: SERIAL_DEVICE=tcp://host:port and drop the devices: mapping.
       SERIAL_DEVICE: ${SERIAL_DEVICE:-/dev/ttyUSB0}
+      SERIAL_DEVICES: ${SERIAL_DEVICES:-}
+      SERIAL_COMMAND_DEVICES: ${SERIAL_COMMAND_DEVICES:-}
       SERIAL_BAUD: ${SERIAL_BAUD:-57600}
       SERIAL_READ_TIMEOUT_SEC: ${SERIAL_READ_TIMEOUT_SEC:-10}
       SERIAL_RECONNECT_MIN_DELAY_SEC: ${SERIAL_RECONNECT_MIN_DELAY_SEC:-3}

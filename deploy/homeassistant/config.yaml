@@ -1,0 +1,40 @@
+name: go-rflink
+version: "0.4.0"
+slug: go_rflink
+description: RFLink gateway to MQTT, with an optional web UI
+url: https://github.com/MERKAT0R/go-RFLink
+arch:
+  - amd64
+  - aarch64
+  - armv7
+uart: true
+init: false
+startup: services
+services:
+  - mqtt:want
+options:
+  serial_device: /dev/ttyUSB0
+  serial_devices: ""
+  serial_command_devices: ""
+  mqtt_host: core-mosquitto
+  mqtt_port: 1883
+  mqtt_user: username
+  mqtt_password: password
+  mqtt_scheme: tcp
+  http_listen: "0.0.0.0:8099"
+  http_auth_token: ""
+  ha_discovery: true
+schema:
+  serial_device: str
+  serial_devices: str?
+  serial_command_devices: str?
+  mqtt_host: str
+  mqtt_port: port
+  mqtt_user: str
+  mqtt_password: password
+  mqtt_scheme: list(tcp|mqtt|ssl|tls|mqtts|ws|wss)
+  http_listen: str
+  http_auth_token: str?
+  ha_discovery: bool
+ports:
+  8099/tcp: 8099

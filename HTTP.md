@@ -31,14 +31,14 @@ Prefer bind `127.0.0.1` and expose only via reverse proxy + TLS.
 | **Meta / CSRF** | none | `GET /api/v1/meta`, `GET /api/v1/csrf` |
 | **GUI** | session cookie after `POST /api/v1/session` | Full UI; CSRF required on POST/PUT/DELETE |
 | **API client** | `Authorization: Bearer` or `X-API-Token` | Automation; **scopes** apply; no CSRF |
-| **WebSocket** | session cookie **or** API token (`Authorization` / `?token=`) | Live raw lines |
+| **WebSocket** | session cookie **or** API token (`Authorization` / `X-API-Token`) | Live raw lines. A `?token=` query is ignored |
 
 ### API token scopes (default: `read,command`)
 
 | Scope | Access |
 |-------|--------|
-| `read` | health, sensors, raw, serial, rate_limit, config GET, backups |
-| `command` | `POST /command`, `POST /ha/rediscover` |
+| `read` | health, sensors, raw, serial, rate_limit, config GET, backups, `GET /metrics` |
+| `command` | `POST /command`, `POST /ha/rediscover`, `POST /ha/purge` |
 | `admin` | config write/restore (tokens/sessions/webhooks still need **GUI session**) |
 
 Env format: `name:TOKEN[:expire[:scopes]]`  
@@ -53,11 +53,12 @@ Optional: `API_TOKEN_PEPPER` mixed into hashes on disk.
 | Method | Path | Auth |
 |--------|------|------|
 | GET | `/healthz`, `/readyz` | public |
+| GET | `/metrics` | session or API `read` |
 | GET | `/api/v1/meta`, `/api/v1/csrf` | public |
 | POST / DELETE | `/api/v1/session` | GUI password / session |
 | GET | `/api/v1/health`, `/sensors`, `/rflink/raw`, `/serial`, `/rate_limit` | session or API `read` |
-| GET/WS | `/api/v1/rflink/raw/ws` | session or API token |
-| POST | `/api/v1/command`, `/ha/rediscover` | session or API `command` |
+| GET/WS | `/api/v1/rflink/raw/ws` | session or API token. Each line has `at`, `message`, and `device` when the gateway is known |
+| POST | `/api/v1/command`, `/ha/rediscover`, `/ha/purge` | session or API `command` |
 | GET/PUT | `/api/v1/config` | session or API `read` / `admin` |
 | POST | `/api/v1/config/restore` | session or API `admin` |
 | GET/POST/DELETE | `/api/v1/tokens` | **GUI session only** |
@@ -66,7 +67,11 @@ Optional: `API_TOKEN_PEPPER` mixed into hashes on disk.
 
 ### RFLink commands
 
-Same path as MQTT: normalize → format check → whitelist → rate-limit → serial.
+Same path as MQTT: normalize → format check → whitelist → rate-limit → the configured gateways. With `SERIAL_COMMAND_DEVICES` empty (the default), that is every connected port: primary `SERIAL_DEVICE`, then `SERIAL_DEVICES`. The call is `ok` only when every selected gateway accepts the write. A mix of success and failure is `partial` (HTTP 503) and the body lists each port. A rate limit is HTTP 429 with `Retry-After`. A JSON body may add `"devices":["COM3"]` to limit that one call. With more than one port, `rflink/serial/status` is `online` only when every port is up; each port also has `rflink/serial/<name>/status`, and `rflink/serial/command/status` is `online` when any command target is up. Those retained `online` values expire after 90 seconds unless the process refreshes them, so a hard kill does not leave a port looking up. Version and PONG for several gateways go to `rflink/gateway/<name>/info`. Home Assistant sensors follow the gateway that last delivered a new frame. A second gateway takes over after 5 seconds, or at once if the current port is down, so one dead board does not mark the others unavailable. Health and the GUI list the ports, with each port's queue fill, drop count, and firmware version. The retained `rflink/health` snapshot expires after 90 seconds unless the process refreshes it.
+
+Each attempt is logged as `rflink command audit` with `source` (`http`, `mqtt`, `webhook`), `actor` (session prefix or token name, never the secret), `status`, and time.
+
+`GET /metrics` is Prometheus text (published, dropped, ping fails, MQTT and serial gauges). It does not list sensor names. `POST /api/v1/ha/purge` publishes an empty retained config for every discovery topic this process still has cached. Topics from an older process are cleared with `scripts/purge-ha-discovery.sh`.
 
 Valid examples (see [RFLink protocol](https://rflink.nl/protref.php)):
 
@@ -87,7 +92,7 @@ Invalid: `44444mmm;`, empty node-only `10;`.
 - Backups: last 3 (`runtime.json.bak.1` … `.3`); restore via API/GUI
 - Hot-reload ~3s mtime poll
 - Dir `0700`, file `0600`, atomic write
-- Editable from GUI: friendly names, ignore list, HA discovery/buttons/switches, API tokens, webhooks  
+- Editable from GUI: friendly names, ignore list, HA discovery/buttons/switches, min interval, throttle, device triggers, per-sensor availability, stale seconds, command targets, API tokens, webhooks. The first save of a key returns `first_time_keys` and `warning`, writes `runtime.json`, and env is ignored for that key afterwards. A request that omits a key does not take it.  
 - **HWID map** is env/API-only (intentionally not in GUI)
 
 ## Sessions (GUI)

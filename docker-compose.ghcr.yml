@@ -19,6 +19,7 @@ services:
       HTTP_LISTEN: "0.0.0.0:8080"
       HTTP_AUTH_TOKEN: use-a-long-random-secret-16+
       RUNTIME_CONFIG_FILE: /app/data/runtime.json
+      TZ: ${TZ:-Etc/UTC}             # IANA zone; the image includes tzdata and defaults to Etc/UTC
     healthcheck:                   # optional: HEALTHCHECK when HTTP is enabled (override if Listen differs)
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
       interval: 30s

@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -101,6 +102,45 @@ func TestValidatorsAndNames(t *testing.T) {
 	if ValidateHADiscoveryPrefix("home/assistant") != nil || ValidateHADiscoveryPrefix("bad prefix") == nil {
 		t.Fatal("prefix")
 	}
+	if ValidateBoundedInt("min_interval_ms", 0, 10) != nil || ValidateBoundedInt("min_interval_ms", 10, 10) != nil {
+		t.Fatal("bounded int edges")
+	}
+	if ValidateBoundedInt("min_interval_ms", -1, 10) == nil || ValidateBoundedInt("min_interval_ms", 11, 10) == nil {
+		t.Fatal("bounded int accepted an out of range value")
+	}
+	if ValidateThrottleCSV("") != nil || ValidateThrottleCSV("OREGON_0001:5000, OTHER_2:1") != nil {
+		t.Fatal(ValidateThrottleCSV("OREGON_0001:5000, OTHER_2:1"))
+	}
+	for _, bad := range []string{"nope", "BAD/ID:10", "OREGON_0001:0", "OREGON_0001:86400001", "A:1\nB:2"} {
+		if ValidateThrottleCSV(bad) == nil {
+			t.Fatalf("throttle accepted %q", bad)
+		}
+	}
+	longThrottle := strings.Repeat("A_1:1,", 65)
+	if ValidateThrottleCSV(longThrottle) == nil {
+		t.Fatal("throttle accepted too many entries")
+	}
+	if ValidateCommandDevicesCSV("") != nil || ValidateCommandDevicesCSV(" COM1 , tcp://10.0.0.8:23 ") != nil {
+		t.Fatal("command devices")
+	}
+	if ValidateCommandDevicesCSV("COM1\nCOM2") == nil || ValidateCommandDevicesCSV(strings.Repeat("p,", 17)) == nil || ValidateCommandDevicesCSV(strings.Repeat("x", 257)) == nil {
+		t.Fatal("command devices accepted junk")
+	}
+	if firstTimeWarning(nil) != "" || !strings.Contains(firstTimeWarning([]string{"min_interval_ms"}), "min_interval_ms") {
+		t.Fatal(firstTimeWarning([]string{"min_interval_ms"}))
+	}
+	var noOpts *Options
+	if !noOpts.commandDeviceAllow("COM1") || noOpts.commandDevicesConfigured() {
+		t.Fatal("nil options filter")
+	}
+	filter := &Options{}
+	filter.Serial.CommandDevices = "com1"
+	if !filter.commandDeviceAllow("COM1") || filter.commandDeviceAllow("COM2") || !filter.commandDevicesConfigured() {
+		t.Fatal("command device filter")
+	}
+	if got := filter.serialDeviceStatusTopic(""); got != "/serial/port/status" {
+		t.Fatal(got)
+	}
 	if parseLogLevel("debug") != slog.LevelDebug || parseLogLevel("warning") != slog.LevelWarn || parseLogLevel("error") != slog.LevelError || parseLogLevel("") != slog.LevelInfo {
 		t.Fatal("log level")
 	}
@@ -152,7 +192,7 @@ func TestSessionStoreAndCookies(t *testing.T) {
 	if s.RevokeAllExcept(a.ID) < 1 || s.Count() != 1 {
 		t.Fatalf("count after revoke %d", s.Count())
 	}
-	if len(s.List()) != 1 {
+	if len(s.List("")) != 1 {
 		t.Fatal("list")
 	}
 	rr := httptest.NewRecorder()
@@ -439,11 +479,12 @@ func TestPublisherHelpersAndDisconnect(t *testing.T) {
 	p.lastSensorAt.Store(time.Time{})
 	p.lastSensorHWID.Store("")
 	p.lastSerialAt.Store(time.Now().Add(-time.Hour))
-	p.appendRawLine("20;02;PONG;")
-	p.appendRawLine("20;03;VER=1;")
-	p.appendRawLine("20;04;X;")
-	if len(p.RecentRawLines()) != 2 {
-		t.Fatalf("raw %d", len(p.RecentRawLines()))
+	p.appendRawLine("", "20;02;PONG;")
+	p.appendRawLine("COM2", "20;03;VER=1;")
+	p.appendRawLine("", "20;04;X;")
+	raw := p.RecentRawLines()
+	if len(raw) != 2 || raw[0].Device != "COM2" || raw[0].Message != "20;03;VER=1;" {
+		t.Fatalf("raw %+v", raw)
 	}
 	temp := float32(1)
 	sd := &SensorData{Hwid: "A_1", Model: "A", Id: "1", Temperature: &temp}
@@ -462,7 +503,7 @@ func TestPublisherHelpersAndDisconnect(t *testing.T) {
 		t.Fatalf("%+v", snap)
 	}
 	p.SetRawLineHook(func(rawLineEntry) {})
-	p.appendRawLine("20;05;Y;")
+	p.appendRawLine("", "20;05;Y;")
 	p.SetSensorHook(func(string, []byte) {})
 	p.Disconnect()
 	if p.PingOutstanding() {

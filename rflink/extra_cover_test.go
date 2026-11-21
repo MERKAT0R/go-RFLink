@@ -118,7 +118,7 @@ func TestWebSocketAuthAndHub(t *testing.T) {
 	})
 
 	t.Run("upgrade hello", func(t *testing.T) {
-		app.publisher.appendRawLine("20;02;PONG;")
+		app.publisher.appendRawLine("", "20;02;PONG;")
 		srv := httptest.NewServer(h.server.Handler)
 		t.Cleanup(srv.Close)
 		u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/api/v1/rflink/raw/ws"
@@ -145,6 +145,40 @@ func TestWebSocketAuthAndHub(t *testing.T) {
 		}
 		if hello.Type != "hello" || len(hello.Buffer) == 0 || hello.Buffer[0].Message != "20;02;PONG;" {
 			t.Fatalf("hello %+v", hello)
+		}
+	})
+
+	t.Run("revoked session stops the stream", func(t *testing.T) {
+		sess, err := app.sessions.Create("203.0.113.20")
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv := httptest.NewServer(h.server.Handler)
+		t.Cleanup(srv.Close)
+		u := "ws" + strings.TrimPrefix(srv.URL, "http") + "/api/v1/rflink/raw/ws"
+		hdr := http.Header{}
+		hdr.Set("Cookie", sessionCookieName+"="+sess.ID)
+		conn, resp, err := (&websocket.Dialer{HandshakeTimeout: 2 * time.Second}).Dial(u, hdr)
+		if err != nil {
+			status := 0
+			if resp != nil {
+				status = resp.StatusCode
+			}
+			t.Fatalf("dial: %v status %d", err, status)
+		}
+		defer func() { _ = conn.Close() }()
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		var hello struct {
+			Type string `json:"type"`
+		}
+		if err := conn.ReadJSON(&hello); err != nil || hello.Type != "hello" {
+			t.Fatalf("hello %v %+v", err, hello)
+		}
+		app.sessions.Revoke(sess.ID)
+		app.publisher.appendRawLine("COM1", "20;99;SECRET;")
+		var line map[string]any
+		if err := conn.ReadJSON(&line); err == nil && line["message"] == "20;99;SECRET;" {
+			t.Fatal("revoked session still received a line")
 		}
 	})
 
@@ -264,6 +298,10 @@ func TestWebhookPollPushAndSanitize(t *testing.T) {
 		expanded, err := expandWebhookGETURL("http://10.1.2.3/h", "raw", []byte("20;01;PING;"))
 		if err != nil || !strings.Contains(expanded, "raw=") {
 			t.Fatalf("%s %v", expanded, err)
+		}
+		kept, err := expandWebhookGETURL("https://example.com/hook?token=abc;tenant=1", "raw", []byte("x"))
+		if err != nil || !strings.Contains(kept, "token=abc;tenant=1") || !strings.Contains(kept, "raw=") {
+			t.Fatalf("query dropped: %s %v", kept, err)
 		}
 		view := webhooksPublicView([]RuntimeWebhook{{
 			Name: "n", Headers: map[string]string{"Authorization": "super-secret-value"},
@@ -416,6 +454,12 @@ func TestMQTTHelpersHASpecAndStop(t *testing.T) {
 	if dedupKey("20;AC;Oregon;ID=1;") != dedupKey("20;AD;Oregon;ID=1;") {
 		t.Fatal("dedup key")
 	}
+	if dedupKey("20;PONG;") == dedupKey("20;OK;") {
+		t.Fatal("gateway replies collapsed")
+	}
+	if dedupKey("20;ID=0001;Oregon;TEMP=00c8;") == dedupKey("20;ID=0002;Oregon;TEMP=00c8;") {
+		t.Fatal("id field stripped")
+	}
 	p.opts.Publish.DedupWindowMs = 0
 	if p.isDuplicate("20;01;Oregon;ID=1;") {
 		t.Fatal("window 0")
@@ -433,6 +477,12 @@ func TestMQTTHelpersHASpecAndStop(t *testing.T) {
 	}
 	if err := validateCmdTopic("rflink", "rflink/send"); err != nil {
 		t.Fatal(err)
+	}
+	if err := validateCmdTopic("rflink", "rflink/status"); err == nil {
+		t.Fatal("status topic accepted as command topic")
+	}
+	if err := validateCmdTopic("rflink", "rflink/serial/status"); err == nil {
+		t.Fatal("serial status accepted as command topic")
 	}
 	if sanitizeTopicSegment("A/B C") != "A_B_C" {
 		t.Fatal(sanitizeTopicSegment("A/B C"))
