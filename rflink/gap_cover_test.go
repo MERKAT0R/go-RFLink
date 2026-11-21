@@ -531,3 +531,22 @@ func TestWebhookStartSnapshotAndPollStop(t *testing.T) {
 	}
 	m.Stop()
 }
+
+func TestFormatLogClockUsesLocalOffset(t *testing.T) {
+	prev := time.Local
+	t.Cleanup(func() { time.Local = prev })
+	instant := time.Date(2026, 11, 21, 14, 20, 6, 715000000, time.UTC)
+
+	time.Local = time.FixedZone("UTC+3", 3*3600)
+	if got := formatLogClock(instant); got != "17:20:06(UTC+3)" {
+		t.Fatal(got)
+	}
+	time.Local = time.FixedZone("UTC+5:30", 5*3600+30*60)
+	if got := formatLogClock(instant); got != "19:50:06(UTC+5:30)" {
+		t.Fatal(got)
+	}
+	time.Local = time.UTC
+	if got := formatLogClock(instant); got != "14:20:06(UTC+0)" {
+		t.Fatal(got)
+	}
+}
