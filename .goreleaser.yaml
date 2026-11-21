@@ -96,6 +96,7 @@ release:
     - Home Assistant can publish a momentary button as a device trigger, show the switch state echoed by RFLink, and mark a single sensor offline after it goes quiet.
     - MQTT can use a client certificate. Commands are logged with who sent them and how they finished.
     - A Home Assistant add-on and an Unraid template are included. In Docker, set `TZ` (the image default is `Etc/UTC`).
+    - Lots of small improvements.
 
     ## Fixes
 

@@ -11,7 +11,11 @@ require (
 	golang.org/x/net v0.63.0
 )
 
-require golang.org/x/sys v0.50.0 // indirect
+require (
+	github.com/stretchr/testify v1.12.1 // indirect
+	go.yaml.in/yaml/v3 v3.0.6 // indirect
+	golang.org/x/sys v0.50.0 // indirect
+)
 
 // Obsolet
 retract (
